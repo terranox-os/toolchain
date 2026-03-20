@@ -1,0 +1,50 @@
+From dc5c70a14479decab9b60910b2390cde4fdeed9a Mon Sep 17 00:00:00 2001
+From: TerranoxOS Builder <build@terranox.local>
+Date: Fri, 13 Mar 2026 16:47:37 -0500
+Subject: [PATCH 1/2] Add Terranox OS triple to LLVM TargetParser
+
+Add x86_64-pc-terranox target triple support to LLVM's Triple class.
+This enables LLVM to recognize TerranoxOS as a valid operating system
+target.
+
+Signed-off-by: Antonette Caldwell <zenvanexus@gmail.com>
+---
+ llvm/include/llvm/TargetParser/Triple.h | 1 +
+ llvm/lib/TargetParser/Triple.cpp        | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
+index 657f42303..550325bec 100644
+--- a/llvm/include/llvm/TargetParser/Triple.h
++++ b/llvm/include/llvm/TargetParser/Triple.h
+@@ -242,6 +242,7 @@ public:
+     ShaderModel, // DirectX ShaderModel
+     LiteOS,
+     Serenity,
++    Terranox,   // TerranoxOS
+     Vulkan, // Vulkan SPIR-V
+     LastOSType = Vulkan
+   };
+diff --git a/llvm/lib/TargetParser/Triple.cpp b/llvm/lib/TargetParser/Triple.cpp
+index 0584c941d..9f570fe52 100644
+--- a/llvm/lib/TargetParser/Triple.cpp
++++ b/llvm/lib/TargetParser/Triple.cpp
+@@ -312,6 +312,7 @@ StringRef Triple::getOSTypeName(OSType Kind) {
+   case RTEMS: return "rtems";
+   case Solaris: return "solaris";
+   case Serenity: return "serenity";
++  case Terranox: return "terranox";
+   case TvOS: return "tvos";
+   case UEFI: return "uefi";
+   case WASI: return "wasi";
+@@ -716,6 +717,7 @@ static Triple::OSType parseOS(StringRef OSName) {
+     .StartsWith("shadermodel", Triple::ShaderModel)
+     .StartsWith("liteos", Triple::LiteOS)
+     .StartsWith("serenity", Triple::Serenity)
++    .StartsWith("terranox", Triple::Terranox)
+     .StartsWith("vulkan", Triple::Vulkan)
+     .Default(Triple::UnknownOS);
+ }
+-- 
+2.43.0
+

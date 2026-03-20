@@ -1,0 +1,64 @@
+From 856648c529af94d5108942568d9d605fb28b43d7 Mon Sep 17 00:00:00 2001
+From: TerranoxOS Builder <build@terranox.local>
+Date: Fri, 13 Mar 2026 16:51:28 -0500
+Subject: [PATCH 2/2] Add TerranoxOSTargetInfo to Clang
+
+Add Terranox OS target support to Clang, defining the __terranox__
+preprocessor macro for x86_64 targets. This enables Clang to correctly
+configure compilation for TerranoxOS.
+
+Signed-off-by: Antonette Caldwell <zenvanexus@gmail.com>
+---
+ clang/lib/Basic/Targets.cpp         |  2 ++
+ clang/lib/Basic/Targets/OSTargets.h | 22 ++++++++++++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/clang/lib/Basic/Targets.cpp b/clang/lib/Basic/Targets.cpp
+index 5d1157889..598becf21 100644
+--- a/clang/lib/Basic/Targets.cpp
++++ b/clang/lib/Basic/Targets.cpp
+@@ -660,6 +660,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
+       return std::make_unique<PS5OSTargetInfo<X86_64TargetInfo>>(Triple, Opts);
+     case llvm::Triple::Hurd:
+       return std::make_unique<HurdTargetInfo<X86_64TargetInfo>>(Triple, Opts);
++    case llvm::Triple::Terranox:
++      return std::make_unique<TerranoxOSTargetInfo<X86_64TargetInfo>>(Triple, Opts);
+     case llvm::Triple::Managarm:
+       return std::make_unique<ManagarmTargetInfo<X86_64TargetInfo>>(Triple,
+                                                                     Opts);
+diff --git a/clang/lib/Basic/Targets/OSTargets.h b/clang/lib/Basic/Targets/OSTargets.h
+index c1a68f464..00f73e0d8 100644
+--- a/clang/lib/Basic/Targets/OSTargets.h
++++ b/clang/lib/Basic/Targets/OSTargets.h
+@@ -1070,6 +1070,28 @@ public:
+   }
+ };
+ 
++
++// TerranoxOS Target
++template <typename Target>
++class LLVM_LIBRARY_VISIBILITY TerranoxOSTargetInfo : public OSTargetInfo<Target> {
++protected:
++  void getOSDefines(const LangOptions &Opts, const llvm::Triple &Triple,
++                    MacroBuilder &Builder) const override {
++    Builder.defineMacro("__terranox__");
++    Builder.defineMacro("__ELF__");
++    if (Opts.POSIXThreads)
++      Builder.defineMacro("_REENTRANT");
++    if (Opts.CPlusPlus)
++      Builder.defineMacro("_GNU_SOURCE");
++  }
++
++public:
++  TerranoxOSTargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts)
++      : OSTargetInfo<Target>(Triple, Opts) {
++    this->WIntType = TargetInfo::UnsignedInt;
++  }
++};
++
+ } // namespace targets
+ } // namespace clang
+ #endif // LLVM_CLANG_LIB_BASIC_TARGETS_OSTARGETS_H
+-- 
+2.43.0
+

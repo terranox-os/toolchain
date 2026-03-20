@@ -1,0 +1,11 @@
+# Build outputs
+/out/
+/toolchain/
+
+# Dagger generated
+.dagger/dagger.gen.go
+.dagger/internal/
+.dagger/querybuilder/
+
+# Go
+.dagger/vendor/

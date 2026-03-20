@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# terranox-os/bootstrap.toml
+#
+# Central configuration for the toolchain bootstrap pipeline.
+# Edit this file to change versions — no Go code changes needed.
+# CLI arguments override these values when provided.
+
+[llvm]
+# Default version to build when --llvm-version is not specified
+default = "21.1.8"
+
+# All versions to test in matrix mode (ordered: bleeding edge first)
+matrix = ["main", "22.1.1", "21.1.8", "20.1.8", "19.1.7"]
+
+# Git repo for "main" channel
+repo = "https://github.com/llvm/llvm-project.git"
+
+# Branch to clone for "main" channel
+branch = "main"
+
+[musl]
+version = "1.2.5"
+
+[linux]
+# Kernel headers version
+version = "6.12.8"
+
+[seed]
+# Wolfi Clang package version used as the bootstrap seed.
+# This is NOT the version we build — it's the compiler that
+# bootstraps the version we build.
+wolfi_clang = "19"
+
+[target]
+triple = "x86_64-linux-musl"
+arch = "x86_64"
+
+# ── Build tunables ──
+
+[build]
+# Parallel jobs (-jN). "auto" = nproc.
+jobs = "auto"
+
+# LLVM projects to enable in Stage 0 and Stage 1
+projects = ["clang", "lld"]
+
+# LLVM targets to build (keep minimal for faster builds)
+targets = ["X86"]
+
+# LLVM runtimes to build against musl sysroot
+runtimes = ["compiler-rt", "libunwind", "libcxxabi", "libcxx"]
+
+# Compiler-rt components to disable (musl doesn't support these)
+disable_rt = ["sanitizers", "xray", "libfuzzer", "profile", "memprof", "orc"]
+
+[build.defaults]
+# Clang defaults baked into the built compiler
+linker = "lld"
+cxx_stdlib = "libc++"
+rtlib = "compiler-rt"
+unwindlib = "libunwind"
+
+# ── Export paths ──
+
+[export]
+# Where to write toolchains on the host (relative to repo root)
+base_dir = "toolchain"
+
+# Symlink name for the active toolchain
+active_link = "active"
