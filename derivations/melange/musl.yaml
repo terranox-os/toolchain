@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# musl libc — the C standard library for TerranoxOS.
+# This is the foundation package: everything else links against it.
+#
+# Build:
+#   dagger call melange-build --source=. --package=musl
+
+package:
+  name: musl
+  version: 1.2.5
+  epoch: 0
+  description: "musl C standard library"
+  copyright:
+    - license: MIT
+  target-architecture:
+    - x86_64
+  checks:
+    disabled:
+      # The dynamic linker must be at /lib/ld-musl-x86_64.so.1 (ABI requirement)
+      - usrmerge
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://musl.libc.org/releases/musl-1.2.5.tar.gz"
+      echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  musl-1.2.5.tar.gz" | sha256sum -c
+      tar xzf musl-1.2.5.tar.gz
+      cd musl-1.2.5
+
+      ./configure \
+        --prefix=/usr \
+        --disable-wrapper
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install
+
+      # Dynamic linker symlink
+      mkdir -p "${{targets.destdir}}/lib"
+      ln -sf /usr/lib/libc.so "${{targets.destdir}}/lib/ld-musl-x86_64.so.1"

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# GNU Make — the standard build automation tool.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=make
+
+package:
+  name: make
+  version: 4.4.1
+  epoch: 0
+  description: "GNU Make build automation tool"
+  copyright:
+    - license: GPL-3.0-or-later
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz"
+      tar xzf make-4.4.1.tar.gz
+      cd make-4.4.1
+
+      ./configure \
+        --prefix=/usr \
+        --without-guile
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install

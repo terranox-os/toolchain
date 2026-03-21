@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# BusyBox — provides shell, coreutils, and init for the minimal base.
+# Static build so it runs without any shared library dependencies.
+#
+# Build:
+#   dagger call melange-build --source=. --package=busybox
+
+package:
+  name: busybox
+  version: 1.36.1
+  epoch: 0
+  description: "BusyBox — the Swiss Army knife of embedded Linux"
+  copyright:
+    - license: GPL-2.0-only
+  target-architecture:
+    - x86_64
+  checks:
+    disabled:
+      # BusyBox installs to /bin and /sbin which are standard for base system
+      - usrmerge
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - linux-headers
+      - perl
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" \
+        || wget -q "https://sources.buildroot.net/busybox/busybox-1.36.1.tar.bz2"
+      tar xjf busybox-1.36.1.tar.bz2
+      cd busybox-1.36.1
+
+      make defconfig
+
+      # Enable static linking
+      sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+
+      # Enable common applets needed for a base system
+      sed -i 's/# CONFIG_ASH_BASH_COMPAT is not set/CONFIG_ASH_BASH_COMPAT=y/' .config
+      sed -i 's/# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+
+      make -j$(nproc)
+
+      # Install
+      mkdir -p "${{targets.destdir}}/bin"
+      install -m 755 busybox "${{targets.destdir}}/bin/busybox"
+
+      # Create symlinks for essential applets
+      for cmd in sh ash login mount umount mkdir rmdir ln ls cp mv rm \
+                 cat echo printf head tail grep sed awk sort uniq \
+                 find xargs chmod chown chgrp date hostname id \
+                 ps kill sleep true false test expr env \
+                 tar gzip gunzip bzip2 bunzip2 xz unxz \
+                 wget vi less more df du free top reboot poweroff \
+                 init getty; do
+        ln -sf busybox "${{targets.destdir}}/bin/$cmd"
+      done
+
+      # /sbin symlinks
+      mkdir -p "${{targets.destdir}}/sbin"
+      for cmd in init halt reboot poweroff; do
+        ln -sf /bin/busybox "${{targets.destdir}}/sbin/$cmd"
+      done

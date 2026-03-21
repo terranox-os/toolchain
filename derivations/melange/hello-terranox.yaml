@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal melange manifest for testing the package build pipeline.
+#
+# Build:
+#   dagger call melange-build --source=. --package=hello-terranox
+
+package:
+  name: hello-terranox
+  version: 0.1.0
+  epoch: 0
+  description: "Minimal test package for TerranoxOS melange pipeline"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - musl
+      - musl-dev
+      - build-base
+
+pipeline:
+  - runs: |
+      cat > hello.c <<'EOF'
+      #include <stdio.h>
+      int main(void) {
+          printf("Hello from TerranoxOS (musl)\n");
+          return 0;
+      }
+      EOF
+      cc -static -o hello hello.c
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      install -m 755 hello "${{targets.destdir}}/usr/bin/hello-terranox"

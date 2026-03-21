@@ -25,6 +25,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"dagger/terranox-bootstrap/internal/dagger"
 )
@@ -254,6 +255,165 @@ func (m *TerranoxBootstrap) MuslSysroot(
 }
 
 // ═══════════════════════════════════════════════════════════
+// SDK Sysroot: musl sysroot + Alpine dev packages
+// ═══════════════════════════════════════════════════════════
+
+// MuslSdkSysroot extends the base musl sysroot with development library
+// headers and static libraries from Alpine. This enables cross-compilation
+// of userspace programs that depend on common C libraries (zlib, openssl, etc.).
+//
+// The package list is driven by the [sdk] section in bootstrap.toml.
+// Alpine packages are used because they are musl-linked and ABI-compatible
+// with the base sysroot.
+//
+// Usage:
+//
+//	dagger call musl-sdk-sysroot
+//	dagger call musl-sdk-sysroot --llvm-version=21.1.8 --source=.
+//	dagger call musl-sdk-sysroot export --path=./sdk-sysroot
+func (m *TerranoxBootstrap) MuslSdkSysroot(
+	ctx context.Context,
+	// LLVM version for runtimes
+	// +default="21.1.8"
+	llvmVersion string,
+	// musl version
+	// +default="1.2.5"
+	muslVersion string,
+	// Linux kernel version for headers
+	// +default="6.12.8"
+	linuxVersion string,
+	// Pre-built base sysroot directory. If not provided,
+	// the base sysroot is built from scratch via MuslSysroot.
+	// +optional
+	sysroot *dagger.Directory,
+	// Repository source directory containing patches/ and bootstrap.toml
+	// +optional
+	source *dagger.Directory,
+) (*dagger.Directory, error) {
+	// Build the base sysroot if not provided
+	baseSysroot := sysroot
+	if baseSysroot == nil {
+		baseSysroot = m.MuslSysroot(llvmVersion, muslVersion, linuxVersion, source)
+	}
+
+	// Load config to get the SDK package list
+	var packages []string
+	if source != nil {
+		cfg, err := LoadConfig(ctx, source)
+		if err != nil {
+			return nil, fmt.Errorf("load config: %w", err)
+		}
+		packages = cfg.Sdk.Packages
+	} else {
+		packages = defaultConfig().Sdk.Packages
+	}
+
+	if len(packages) == 0 {
+		// No packages configured — return the base sysroot unchanged
+		return baseSysroot, nil
+	}
+
+	// Use Alpine to fetch and extract dev packages into the sysroot.
+	// We install packages into a temporary root, then copy only the
+	// headers and libraries into the sysroot — avoiding runtime deps.
+	sdkSysroot := dag.Container().
+		From("alpine:latest").
+		WithExec([]string{"apk", "add", "--no-cache", "tar"}).
+		WithDirectory("/opt/terranox/sysroot", baseSysroot).
+		WithExec([]string{"mkdir", "-p", "/tmp/sdk-pkgs"}).
+		// Fetch the requested packages as .apk files
+		WithExec(append([]string{"apk", "fetch", "--no-cache", "-o", "/tmp/sdk-pkgs"}, packages...)).
+		// Extract each package's contents into the sysroot
+		WithExec([]string{"sh", "-c", `
+			for apk in /tmp/sdk-pkgs/*.apk; do
+				[ -f "$apk" ] || continue
+				echo "Extracting: $(basename "$apk")"
+				tar -xzf "$apk" -C /opt/terranox/sysroot 2>/dev/null || true
+			done
+			# Remove apk metadata that may have been extracted
+			rm -rf /opt/terranox/sysroot/.PKGINFO /opt/terranox/sysroot/.SIGN.* /opt/terranox/sysroot/.post-install /opt/terranox/sysroot/.pre-install /opt/terranox/sysroot/.trigger
+		`}).
+		Directory("/opt/terranox/sysroot")
+
+	return sdkSysroot, nil
+}
+
+// TestSdkSysroot verifies the SDK sysroot contains development headers
+// and static libraries, and that a simple program can compile and link
+// against them.
+//
+// Usage:
+//
+//	dagger call test-sdk-sysroot
+//	dagger call test-sdk-sysroot --llvm-version=21.1.8 --source=.
+func (m *TerranoxBootstrap) TestSdkSysroot(
+	ctx context.Context,
+	// +default="21.1.8"
+	llvmVersion string,
+	// Repository source directory containing patches/ and bootstrap.toml
+	// +optional
+	source *dagger.Directory,
+) (string, error) {
+	sdkSysroot, err := m.MuslSdkSysroot(ctx, llvmVersion, DefaultMuslVersion, DefaultLinuxVersion, nil, source)
+	if err != nil {
+		return "", fmt.Errorf("build SDK sysroot: %w", err)
+	}
+
+	// Load config to report which packages were expected
+	var packages []string
+	if source != nil {
+		cfg, err := LoadConfig(ctx, source)
+		if err != nil {
+			return "", fmt.Errorf("load config: %w", err)
+		}
+		packages = cfg.Sdk.Packages
+	} else {
+		packages = defaultConfig().Sdk.Packages
+	}
+
+	return m.Base().
+		WithDirectory("/sysroot", sdkSysroot).
+		WithNewFile("/tmp/test_zlib.c", `
+			#include <zlib.h>
+			#include <stdio.h>
+			int main(void) {
+				printf("zlib version: %s\n", zlibVersion());
+				return 0;
+			}
+		`).
+		WithExec([]string{"sh", "-c", `
+			echo "=== SDK Sysroot Verification ==="
+			echo
+			echo "Configured packages: ` + strings.Join(packages, ", ") + `"
+			echo
+			echo "--- Dev headers ---"
+			[ -f /sysroot/usr/include/zlib.h ] && echo "PASS: zlib.h" || echo "FAIL: zlib.h missing"
+			[ -f /sysroot/usr/include/openssl/ssl.h ] && echo "PASS: openssl/ssl.h" || echo "FAIL: openssl/ssl.h missing"
+			[ -f /sysroot/usr/include/ncurses.h ] && echo "PASS: ncurses.h" || echo "FAIL: ncurses.h missing"
+			[ -f /sysroot/usr/include/readline/readline.h ] && echo "PASS: readline/readline.h" || echo "FAIL: readline/readline.h missing"
+			echo
+			echo "--- Static libraries ---"
+			[ -f /sysroot/usr/lib/libz.a ] && echo "PASS: libz.a" || echo "FAIL: libz.a missing"
+			[ -f /sysroot/usr/lib/libssl.a ] && echo "PASS: libssl.a" || echo "FAIL: libssl.a missing"
+			[ -f /sysroot/usr/lib/libcrypto.a ] && echo "PASS: libcrypto.a" || echo "FAIL: libcrypto.a missing"
+			echo
+			echo "--- Compile test: zlib ---"
+		`}).
+		WithExec([]string{"clang",
+			"--target=" + Target,
+			"--sysroot=/sysroot",
+			"-static",
+			"-fuse-ld=lld",
+			"-o", "/tmp/test_zlib",
+			"/tmp/test_zlib.c",
+			"-lz"}).
+		WithExec([]string{"file", "/tmp/test_zlib"}).
+		WithExec([]string{"/tmp/test_zlib"}).
+		WithExec([]string{"sh", "-c", `echo && echo "=== All SDK sysroot tests passed ==="`}).
+		Stdout(ctx)
+}
+
+// ═══════════════════════════════════════════════════════════
 // Stage 1: Self-hosted Clang (Alpine/musl host)
 // ═══════════════════════════════════════════════════════════
 
@@ -452,4 +612,143 @@ func (m *TerranoxBootstrap) MuslBootstrap(
 	"target": "%s",
 	"variant": "musl"
 }`, llvmVersion, DefaultMuslVersion, DefaultLinuxVersion, Target)), nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// SDK Export and Image
+// ═══════════════════════════════════════════════════════════
+
+// ExportSdkSysroot builds the SDK sysroot and writes it to the host filesystem.
+//
+// Usage:
+//
+//	dagger call export-sdk-sysroot --llvm-version=21.1.8 --source=. --output=./out/sdk-sysroot
+func (m *TerranoxBootstrap) ExportSdkSysroot(
+	ctx context.Context,
+	// +default="21.1.8"
+	llvmVersion string,
+	// Host directory to export to
+	output *dagger.Directory,
+	// Repository source directory containing patches/ and bootstrap.toml
+	// +optional
+	source *dagger.Directory,
+) (*dagger.Directory, error) {
+	sdkSysroot, err := m.MuslSdkSysroot(ctx, llvmVersion, DefaultMuslVersion, DefaultLinuxVersion, nil, source)
+	if err != nil {
+		return nil, fmt.Errorf("build SDK sysroot: %w", err)
+	}
+	return output.WithDirectory(".", sdkSysroot), nil
+}
+
+// SdkImage creates a Wolfi-style OCI container image with the Stage1
+// toolchain and the SDK sysroot installed. This is a self-contained
+// development environment for cross-compiling userspace programs
+// against musl with common libraries (zlib, openssl, etc.) available.
+//
+// The image is modeled after Wolfi/Chainguard SDK images:
+//   - Minimal Alpine base (musl-native, no glibc compat)
+//   - Toolchain at /opt/terranox/toolchain
+//   - SDK sysroot at /opt/terranox/sysroot (includes dev headers + static libs)
+//   - Build tools (cmake, ninja, git, make, pkg-config)
+//   - PATH and sysroot env vars pre-configured
+//
+// Usage:
+//
+//	# Export as OCI tarball:
+//	dagger call sdk-image --source=. export --path=./terranox-sdk.tar
+//
+//	# Publish to registry:
+//	dagger call sdk-image --source=. publish --address=ghcr.io/terranox-os/sdk:latest
+//
+//	# Interactive shell:
+//	dagger call sdk-image --source=. terminal
+func (m *TerranoxBootstrap) SdkImage(
+	ctx context.Context,
+	// +default="21.1.8"
+	llvmVersion string,
+	// +default="1.2.5"
+	muslVersion string,
+	// +default="6.12.8"
+	linuxVersion string,
+	// Pre-built Stage1 toolchain directory. If not provided, built from scratch.
+	// +optional
+	toolchain *dagger.Directory,
+	// Pre-built SDK sysroot directory. If not provided, built from scratch.
+	// +optional
+	sdkSysroot *dagger.Directory,
+	// Repository source directory containing patches/ and bootstrap.toml
+	// +optional
+	source *dagger.Directory,
+) (*dagger.Container, error) {
+	// Build toolchain if not provided
+	if toolchain == nil {
+		toolchain = m.MuslStage1(llvmVersion, muslVersion, linuxVersion, nil, nil, source)
+	}
+
+	// Build SDK sysroot if not provided
+	if sdkSysroot == nil {
+		var err error
+		sdkSysroot, err = m.MuslSdkSysroot(ctx, llvmVersion, muslVersion, linuxVersion, nil, source)
+		if err != nil {
+			return nil, fmt.Errorf("build SDK sysroot: %w", err)
+		}
+	}
+
+	return dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache",
+			"bash", "cmake", "ninja", "samurai", "make",
+			"git", "file", "pkgconf",
+			"python3", "perl",
+		}).
+		WithDirectory("/opt/terranox/toolchain", toolchain).
+		WithDirectory("/opt/terranox/sysroot", sdkSysroot).
+		// Copy runtime libraries into toolchain's Clang resource dir
+		WithExec([]string{"sh", "-c", `
+			mkdir -p /opt/terranox/toolchain/lib/clang/21/lib/x86_64-unknown-linux-musl
+			cp -a /opt/terranox/sysroot/usr/lib/linux/* \
+				/opt/terranox/toolchain/lib/clang/21/lib/x86_64-unknown-linux-musl/ 2>/dev/null || true
+			cp /opt/terranox/sysroot/usr/lib/crt*.o \
+				/opt/terranox/toolchain/lib/clang/21/lib/x86_64-unknown-linux-musl/ 2>/dev/null || true
+
+			# Create symlinks for expected filenames
+			cd /opt/terranox/toolchain/lib/clang/21/lib/x86_64-unknown-linux-musl
+			ln -sf libclang_rt.builtins-x86_64.a libclang_rt.builtins.a 2>/dev/null || true
+			ln -sf clang_rt.crtbegin-x86_64.o crtbeginS.o 2>/dev/null || true
+			ln -sf clang_rt.crtbegin-x86_64.o crtbegin.o 2>/dev/null || true
+			ln -sf clang_rt.crtend-x86_64.o crtendS.o 2>/dev/null || true
+			ln -sf clang_rt.crtend-x86_64.o crtend.o 2>/dev/null || true
+		`}).
+		// Convenience wrapper so bare `cc` / `c++` just work
+		WithExec([]string{"sh", "-c", `
+			ln -sf /opt/terranox/toolchain/bin/clang /usr/local/bin/cc
+			ln -sf /opt/terranox/toolchain/bin/clang++ /usr/local/bin/c++
+			ln -sf /opt/terranox/toolchain/bin/lld /usr/local/bin/ld
+			ln -sf /opt/terranox/toolchain/bin/llvm-ar /usr/local/bin/ar
+			ln -sf /opt/terranox/toolchain/bin/llvm-ranlib /usr/local/bin/ranlib
+			ln -sf /opt/terranox/toolchain/bin/llvm-nm /usr/local/bin/nm
+			ln -sf /opt/terranox/toolchain/bin/llvm-objdump /usr/local/bin/objdump
+			ln -sf /opt/terranox/toolchain/bin/llvm-strip /usr/local/bin/strip
+		`}).
+		WithEnvVariable("PATH", "/opt/terranox/toolchain/bin:/usr/local/bin:/usr/bin:/bin").
+		WithEnvVariable("TERRANOX_SYSROOT", "/opt/terranox/sysroot").
+		WithEnvVariable("TERRANOX_VERSION", llvmVersion).
+		WithEnvVariable("CC", "clang --sysroot=/opt/terranox/sysroot").
+		WithEnvVariable("CXX", "clang++ --sysroot=/opt/terranox/sysroot -stdlib=libc++").
+		WithEnvVariable("LD", "ld.lld").
+		WithEnvVariable("AR", "llvm-ar").
+		WithEnvVariable("RANLIB", "llvm-ranlib").
+		WithEnvVariable("PKG_CONFIG_SYSROOT_DIR", "/opt/terranox/sysroot").
+		WithEnvVariable("PKG_CONFIG_PATH", "/opt/terranox/sysroot/usr/lib/pkgconfig").
+		WithLabel("org.opencontainers.image.title", "TerranoxOS SDK").
+		WithLabel("org.opencontainers.image.description",
+			"Musl-based SDK with LLVM/Clang toolchain and development libraries for TerranoxOS").
+		WithLabel("org.opencontainers.image.version", llvmVersion).
+		WithLabel("org.opencontainers.image.vendor", "TerranoxOS").
+		WithLabel("org.opencontainers.image.licenses", "Apache-2.0").
+		WithLabel("terranox.llvm.version", llvmVersion).
+		WithLabel("terranox.musl.version", muslVersion).
+		WithLabel("terranox.target", Target).
+		WithLabel("terranox.variant", "sdk").
+		WithWorkdir("/workspace"), nil
 }

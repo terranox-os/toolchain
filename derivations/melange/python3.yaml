@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Python 3 — required for LLVM builds, meson, and scripting.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=python3
+
+package:
+  name: python3
+  version: 3.12.2
+  epoch: 0
+  description: "Python 3 programming language"
+  copyright:
+    - license: PSF-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - linux-headers
+      - openssl-dev
+      - zlib-dev
+      - readline-dev
+      - ncurses-dev
+      - bzip2-dev
+      - xz-dev
+      - libffi-dev
+      - expat-dev
+      - sqlite-dev
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://www.python.org/ftp/python/3.12.2/Python-3.12.2.tar.xz"
+      tar xJf Python-3.12.2.tar.xz
+      cd Python-3.12.2
+
+      ./configure \
+        --prefix=/usr \
+        --enable-shared \
+        --with-system-ffi \
+        --with-system-expat \
+        --with-ensurepip=install \
+        --enable-optimizations
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install
+
+      # Standard symlinks
+      ln -sf python3 "${{targets.destdir}}/usr/bin/python"
+      ln -sf pip3 "${{targets.destdir}}/usr/bin/pip"

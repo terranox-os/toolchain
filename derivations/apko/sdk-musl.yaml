@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# apko configuration for TerranoxOS musl SDK image.
+#
+# This is the "musl Wolfi" — a minimal, musl-native development image
+# assembled from Alpine packages via apko. Unlike Wolfi (glibc-only),
+# everything here is musl-linked for ABI consistency with TerranoxOS.
+#
+# Build:
+#   dagger call apko-build --config=derivations/apko/sdk-musl.yaml --source=.
+#
+# Or directly with apko:
+#   apko build derivations/apko/sdk-musl.yaml terranox-sdk:latest sdk-musl.tar
+
+contents:
+  keyring:
+    - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+  repositories:
+    - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    - https://dl-cdn.alpinelinux.org/alpine/v3.19/community
+  packages:
+    # -- Core system --
+    - alpine-baselayout
+    - alpine-keys
+    - busybox
+    - musl
+    - musl-utils
+    - ca-certificates-bundle
+    - ssl_client
+
+    # -- Build essentials --
+    - build-base
+    - cmake
+    - ninja
+    - samurai
+    - make
+    - pkgconf
+    - patch
+    - file
+
+    # -- Dev headers + static libs (musl-native) --
+    - musl-dev
+    - linux-headers
+    - zlib-dev
+    - zlib-static
+    - openssl-dev
+    - openssl-libs-static
+    - ncurses-dev
+    - readline-dev
+    - libffi-dev
+    - xz-dev
+    - bzip2-dev
+
+    # -- VCS + scripting --
+    - git
+    - python3
+    - perl
+    - bash
+
+    # -- Utilities --
+    - curl
+    - wget
+    - tar
+    - gzip
+    - xz
+    - coreutils
+    - findutils
+    - grep
+    - sed
+    - gawk
+
+archs:
+  - x86_64
+
+environment:
+  PATH: /usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+
+accounts:
+  groups:
+    - groupname: build
+      gid: 1000
+  users:
+    - username: build
+      uid: 1000
+      gid: 1000
+      shell: /bin/bash
+  run-as: 0
+
+entrypoint:
+  command: /bin/bash
+
+work-dir: /workspace
+
+annotations:
+  org.opencontainers.image.title: "TerranoxOS Musl SDK"
+  org.opencontainers.image.description: "Musl-native SDK image — Alpine packages assembled via apko for TerranoxOS cross-compilation"
+  org.opencontainers.image.vendor: "TerranoxOS"
+  org.opencontainers.image.licenses: "Apache-2.0"

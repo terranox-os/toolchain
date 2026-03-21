@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CMake — cross-platform build system generator.
+# Required for building LLVM, most C++ projects, etc.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=cmake
+
+package:
+  name: cmake
+  version: 3.28.3
+  epoch: 0
+  description: "CMake cross-platform build system generator"
+  copyright:
+    - license: BSD-3-Clause
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - linux-headers
+      - openssl-dev
+      - ncurses-dev
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3.tar.gz"
+      tar xzf cmake-3.28.3.tar.gz
+      cd cmake-3.28.3
+
+      # Bootstrap CMake using all bundled dependencies for maximum portability.
+      # System libs cause API compat issues with Alpine 3.19's versions.
+      ./bootstrap \
+        --prefix=/usr \
+        --parallel=$(nproc)
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install

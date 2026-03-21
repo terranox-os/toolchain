@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# apko configuration for TerranoxOS base image.
+#
+# This is the minimal self-hosting base: musl + busybox + apk-tools + TLS.
+# Once this image exists, it replaces alpine:3.19 as the build host for
+# subsequent melange builds — achieving full self-hosting.
+#
+# Bootstrap order:
+#   1. Build core packages with melange (using Alpine as seed)
+#   2. Assemble this base image with apko (from melange-built + Alpine packages)
+#   3. Rebuild core packages using this image as build host (self-hosting)
+#
+# Phase 1 (current): Pull most packages from Alpine, overlay with
+# melange-built TerranoxOS packages as they become available.
+#
+# Phase 2 (future): All packages from TerranoxOS melange repo.
+#
+# Build:
+#   dagger call apko-build --source=. --config=derivations/apko/base-terranox.yaml
+#
+# Build with local melange packages:
+#   dagger call apko-build --source=. --config=derivations/apko/base-terranox.yaml \
+#     --local-repo=./packages/x86_64
+
+contents:
+  keyring:
+    - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+  repositories:
+    - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+  packages:
+    # -- Core (Phase 1: from Alpine, Phase 2: replaced by melange-built) --
+    - alpine-baselayout
+    - alpine-keys
+    - musl
+    - musl-utils
+    - busybox
+    - apk-tools
+
+    # -- TLS/crypto --
+    - ca-certificates-bundle
+    - ssl_client
+    - libcrypto3
+    - libssl3
+
+    # -- Shell --
+    - busybox-binsh
+
+archs:
+  - x86_64
+
+environment:
+  PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+
+accounts:
+  groups:
+    - groupname: nobody
+      gid: 65534
+  run-as: root
+
+entrypoint:
+  command: /bin/sh
+
+work-dir: /
+
+annotations:
+  org.opencontainers.image.title: "TerranoxOS Base"
+  org.opencontainers.image.description: "Minimal musl-native base image for TerranoxOS — self-hosting bootstrap target"
+  org.opencontainers.image.vendor: "TerranoxOS"
+  org.opencontainers.image.licenses: "Apache-2.0"

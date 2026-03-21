@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bash — the Bourne Again Shell. Required for most build scripts.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=bash
+
+package:
+  name: bash
+  version: 5.2.37
+  epoch: 0
+  description: "GNU Bourne Again Shell"
+  copyright:
+    - license: GPL-3.0-or-later
+  target-architecture:
+    - x86_64
+  checks:
+    disabled:
+      - usrmerge
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - ncurses-dev
+      - readline-dev
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz"
+      tar xzf bash-5.2.37.tar.gz
+      cd bash-5.2.37
+
+      ./configure \
+        --prefix=/usr \
+        --without-bash-malloc \
+        --with-installed-readline
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install
+
+      # Create /bin/bash symlink (many scripts expect this)
+      mkdir -p "${{targets.destdir}}/bin"
+      ln -sf /usr/bin/bash "${{targets.destdir}}/bin/bash"
+      ln -sf /usr/bin/bash "${{targets.destdir}}/bin/sh"

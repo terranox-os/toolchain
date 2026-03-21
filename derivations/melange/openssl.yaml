@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenSSL — TLS/crypto library. Required by apk-tools for HTTPS
+# repository access and by most network-facing software.
+#
+# Build:
+#   dagger call melange-build --source=. --package=openssl
+
+package:
+  name: openssl
+  version: 3.2.1
+  epoch: 0
+  description: "OpenSSL cryptography and TLS library"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - linux-headers
+      - perl
+      - wget
+      - zlib-dev
+
+pipeline:
+  - runs: |
+      wget -q "https://github.com/openssl/openssl/releases/download/openssl-3.2.1/openssl-3.2.1.tar.gz"
+      echo "83c7329fe52c850677d75e5d0b0ca245309b97e8ecbcfdc1dfdc4ab9fac35b39  openssl-3.2.1.tar.gz" | sha256sum -c
+      tar xzf openssl-3.2.1.tar.gz
+      cd openssl-3.2.1
+
+      ./Configure \
+        linux-x86_64 \
+        --prefix=/usr \
+        --libdir=lib \
+        --openssldir=/etc/ssl \
+        shared \
+        zlib \
+        no-async \
+        no-comp \
+        no-idea \
+        no-mdc2 \
+        no-rc5 \
+        no-ec2m \
+        no-ssl3 \
+        no-weak-ssl-ciphers \
+        -O2
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install_sw install_ssldirs
+
+      # Strip binaries
+      strip "${{targets.destdir}}/usr/bin/openssl" 2>/dev/null || true
+      strip "${{targets.destdir}}/usr/lib/libssl.so"* 2>/dev/null || true
+      strip "${{targets.destdir}}/usr/lib/libcrypto.so"* 2>/dev/null || true

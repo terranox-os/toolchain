@@ -22,6 +22,7 @@ type Config struct {
 	Target TargetConfig `toml:"target"`
 	Build  BuildConfig  `toml:"build"`
 	Export ExportConfig `toml:"export"`
+	Sdk    SdkConfig    `toml:"sdk"`
 }
 
 type LLVMConfig struct {
@@ -67,6 +68,10 @@ type BuildDefaults struct {
 type ExportConfig struct {
 	BaseDir    string `toml:"base_dir"`
 	ActiveLink string `toml:"active_link"`
+}
+
+type SdkConfig struct {
+	Packages []string `toml:"packages"`
 }
 
 // LoadConfig reads bootstrap.toml from the given directory.
@@ -127,6 +132,9 @@ func defaultConfig() *Config {
 		Export: ExportConfig{
 			BaseDir:    "toolchain",
 			ActiveLink: "active",
+		},
+		Sdk: SdkConfig{
+			Packages: []string{"zlib-dev", "zlib-static", "openssl-dev", "openssl-libs-static", "ncurses-dev", "readline-dev"},
 		},
 	}
 }

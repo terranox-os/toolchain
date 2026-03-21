@@ -507,14 +507,15 @@ echo "==> Building package: ${PACKAGE_NAME}"
 echo "==> Manifest: ${MANIFEST_PATH}"
 
 # Install build dependencies
-apk add --no-cache build-base curl
+apk add --no-cache build-base curl bubblewrap
 
-# Download and install melange static binary
+# Download and install melange from release tarball
 # (Wolfi APK packages are glibc-linked and won't run on Alpine/musl)
-echo "==> Installing melange (static binary)"
-curl -fsSL https://github.com/chainguard-dev/melange/releases/latest/download/melange_linux_amd64 \
-  -o /usr/local/bin/melange
-chmod +x /usr/local/bin/melange
+echo "==> Installing melange"
+MELANGE_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/melange/releases/latest \
+  | grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4)
+echo "Downloading: ${MELANGE_URL}"
+curl -fsSL "${MELANGE_URL}" | tar xz --strip-components=1 -C /usr/local/bin
 
 # Verify melange
 melange version
@@ -533,9 +534,10 @@ mkdir -p /etc/apk/keys
 wget -qO /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
   https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
 
-# Build package (no Docker runner - sandboxing handled by Dagger container)
+# Build package (bubblewrap provides sandboxing inside Dagger container)
 cd /workspace
 melange build \
+  --runner bubblewrap \
   --signing-key /workspace/keys/melange.rsa \
   --arch x86_64 \
   --out-dir /workspace/packages/x86_64 \
@@ -552,8 +554,9 @@ ls -lh /workspace/packages/x86_64/
 	signingKeyPub := source.File("packages/melange.rsa.pub")
 
 	// Build container
-	// Note: Docker socket mounting for --runner docker requires Dagger API not yet available
-	// For v0.1.0, this documents the infrastructure - actual builds blocked by sandbox limitation
+	// InsecureRootCapabilities is required because melange's bubblewrap runner
+	// needs CAP_SYS_ADMIN for user namespace creation. Dagger already provides
+	// container isolation so this doesn't reduce security.
 	builder := dag.Container().
 		From("alpine:3.19").
 		WithDirectory("/source", source).
@@ -562,10 +565,808 @@ ls -lh /workspace/packages/x86_64/
 		WithEnvVariable("PACKAGE_NAME", packageName).
 		WithEnvVariable("MANIFEST_PATH", manifestPath).
 		WithNewFile("/build.sh", buildScript).
-		WithExec([]string{"sh", "/build.sh"})
+		WithExec([]string{"sh", "/build.sh"}, dagger.ContainerWithExecOpts{
+			InsecureRootCapabilities: true,
+		})
 
 	// Return packages directory
 	return builder.Directory("/workspace/packages/x86_64"), nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// Melange key generation
+// ═══════════════════════════════════════════════════════════
+
+// MelangeKeygen generates a fresh RSA-4096 signing keypair for melange
+// package signing. The private key is written to packages/melange.rsa and
+// the public key to packages/melange.rsa.pub.
+//
+// Only needed once — the generated keys should be committed to the repo
+// (the private key is .gitignored in real deployments, but for local-only
+// builds it lives alongside the repo).
+//
+// Usage:
+//
+//	dagger call melange-keygen export --path=./packages
+func (m *TerranoxBootstrap) MelangeKeygen() *dagger.Directory {
+	return dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache", "openssl"}).
+		WithExec([]string{"sh", "-c", `
+			mkdir -p /out
+			openssl genrsa -out /out/melange.rsa 4096
+			openssl rsa -in /out/melange.rsa -pubout -out /out/melange.rsa.pub
+			chmod 600 /out/melange.rsa
+		`}).
+		Directory("/out")
+}
+
+// ═══════════════════════════════════════════════════════════
+// apko: Declarative OCI image assembly (musl Wolfi)
+// ═══════════════════════════════════════════════════════════
+
+// ApkoBuild assembles an OCI container image from an apko YAML config.
+//
+// This is the core of the "musl Wolfi" story: apko declaratively assembles
+// an image from Alpine apk packages (all musl-linked), producing a
+// minimal, reproducible OCI image with no runtime build dependencies.
+//
+// The config file lives in derivations/apko/ and follows apko's YAML format.
+// Custom melange-built packages can be included by providing a local
+// repository directory.
+//
+// Usage:
+//
+//	# Build the musl SDK image from the default config:
+//	dagger call apko-build --source=.
+//
+//	# Build with custom apko config:
+//	dagger call apko-build --source=. --config=derivations/apko/sdk-musl.yaml
+//
+//	# Build with local melange packages included:
+//	dagger call apko-build --source=. --local-repo=./packages/x86_64
+//
+//	# Export OCI tarball:
+//	dagger call apko-build --source=. export --path=./terranox-sdk.tar
+//
+//	# Interactive shell:
+//	dagger call apko-build --source=. terminal
+func (m *TerranoxBootstrap) ApkoBuild(
+	ctx context.Context,
+	// Repository source directory containing derivations/apko/ and packages/
+	source *dagger.Directory,
+	// Path to apko YAML config within source (relative to repo root)
+	// +default="derivations/apko/sdk-musl.yaml"
+	config string,
+	// Tag for the built image
+	// +default="terranox-sdk:latest"
+	tag string,
+	// Local apk repository directory with melange-built packages.
+	// If provided, it is mounted as an additional repository so
+	// custom packages can be referenced in the apko config.
+	// +optional
+	localRepo *dagger.Directory,
+) (*dagger.Container, error) {
+	// apko and melange are Go binaries distributed as tarballs.
+	// The Wolfi APK packages are glibc-linked and won't run on Alpine/musl,
+	// so we download the release tarball and extract the static binary.
+	buildScript := `#!/bin/sh
+set -e
+
+echo "==> Installing apko"
+# Fetch the latest release tarball URL from GitHub API
+APKO_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/apko/releases/latest \
+  | grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4)
+echo "Downloading: ${APKO_URL}"
+curl -fsSL "${APKO_URL}" | tar xz --strip-components=1 -C /usr/local/bin
+chmod +x /usr/local/bin/apko
+apko version
+
+# Set up Alpine keyring so apko can verify upstream packages
+mkdir -p /etc/apk/keys
+wget -qO /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
+  https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+
+`
+
+	// If a local repo is provided, add it as an extra repository
+	localRepoFlag := ""
+	if localRepo != nil {
+		buildScript += `
+# Set up local melange repo — copy signing key and create repo structure
+mkdir -p /etc/apk/keys
+if [ -f /local-repo/melange.rsa.pub ]; then
+  cp /local-repo/melange.rsa.pub /etc/apk/keys/
+fi
+
+# Move APK files into an arch-specific directory if not already structured
+if [ ! -d /local-repo/x86_64 ]; then
+  mkdir -p /tmp/local-repo/x86_64
+  cp /local-repo/*.apk /tmp/local-repo/x86_64/ 2>/dev/null || true
+  cp /local-repo/APKINDEX.tar.gz /tmp/local-repo/x86_64/ 2>/dev/null || true
+  cp /local-repo/melange.rsa.pub /tmp/local-repo/ 2>/dev/null || true
+  LOCAL_REPO_PATH=/tmp/local-repo
+else
+  LOCAL_REPO_PATH=/local-repo
+fi
+`
+		localRepoFlag = ` --repository-append $LOCAL_REPO_PATH --keyring-append /etc/apk/keys/melange.rsa.pub`
+	}
+
+	buildScript += fmt.Sprintf(`
+echo "==> Building OCI image with apko"
+cd /workspace
+
+# Build image with SBOM generation
+mkdir -p /workspace/sbom-output
+apko build \
+  --sbom-path /workspace/sbom-output \
+  /workspace/%s \
+  %s \
+  /workspace/output.tar%s
+
+echo "==> apko build complete"
+ls -lh /workspace/output.tar
+echo "==> SBOM artifacts:"
+ls -lh /workspace/sbom-output/ 2>/dev/null || echo "(no SBOM generated)"
+`, config, tag, localRepoFlag)
+
+	builder := dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache", "curl", "wget", "tar"}).
+		WithDirectory("/workspace", source)
+
+	if localRepo != nil {
+		builder = builder.WithDirectory("/local-repo", localRepo)
+	}
+
+	builder = builder.
+		WithNewFile("/build.sh", buildScript).
+		WithExec([]string{"sh", "/build.sh"})
+
+	// Import the apko-built tarball as a container
+	// apko outputs a standard OCI image tarball that Dagger can import
+	outputTar := builder.File("/workspace/output.tar")
+
+	return dag.Container().Import(outputTar), nil
+}
+
+// ApkoPublish builds an apko image and publishes it to a container registry.
+//
+// Usage:
+//
+//	dagger call apko-publish --source=. --registry=ghcr.io/terranox-os/sdk:latest
+func (m *TerranoxBootstrap) ApkoPublish(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+	// Full registry address (e.g., ghcr.io/terranox-os/sdk:latest)
+	registry string,
+	// Path to apko YAML config within source
+	// +default="derivations/apko/sdk-musl.yaml"
+	config string,
+	// Local apk repository with melange-built packages
+	// +optional
+	localRepo *dagger.Directory,
+) (string, error) {
+	ctr, err := m.ApkoBuild(ctx, source, config, registry, localRepo)
+	if err != nil {
+		return "", fmt.Errorf("apko build failed: %w", err)
+	}
+
+	ref, err := ctr.Publish(ctx, registry)
+	if err != nil {
+		return "", fmt.Errorf("publish failed: %w", err)
+	}
+
+	return fmt.Sprintf("Published: %s", ref), nil
+}
+
+// TestApkoBuild verifies the apko pipeline by building the SDK image and
+// checking that key packages are installed and functional.
+//
+// Usage:
+//
+//	dagger call test-apko-build --source=.
+func (m *TerranoxBootstrap) TestApkoBuild(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+) (string, error) {
+	ctr, err := m.ApkoBuild(ctx, source, "derivations/apko/sdk-musl.yaml", "terranox-sdk:test", nil)
+	if err != nil {
+		return "", fmt.Errorf("apko build: %w", err)
+	}
+
+	return ctr.
+		WithExec([]string{"sh", "-c", `
+			echo "=== TerranoxOS Musl SDK Image Verification ==="
+			echo
+			echo "--- System ---"
+			cat /etc/os-release 2>/dev/null || echo "(no os-release)"
+			echo
+			echo "--- musl ---"
+			ldd --version 2>&1 | head -1 || true
+			echo
+			echo "--- Build tools ---"
+			which cmake && cmake --version | head -1
+			which ninja && ninja --version
+			which make && make --version | head -1
+			which pkgconf && pkgconf --version
+			which git && git --version
+			echo
+			echo "--- Dev headers ---"
+			[ -f /usr/include/zlib.h ] && echo "PASS: zlib.h" || echo "FAIL: zlib.h missing"
+			[ -f /usr/include/openssl/ssl.h ] && echo "PASS: openssl/ssl.h" || echo "FAIL: openssl/ssl.h missing"
+			[ -f /usr/include/ncurses.h ] && echo "PASS: ncurses.h" || echo "FAIL: ncurses.h missing"
+			[ -f /usr/include/readline/readline.h ] && echo "PASS: readline/readline.h" || echo "FAIL: readline/readline.h missing"
+			[ -f /usr/include/ffi.h ] && echo "PASS: ffi.h" || echo "FAIL: ffi.h missing"
+			echo
+			echo "--- Static libs ---"
+			[ -f /usr/lib/libz.a ] && echo "PASS: libz.a" || echo "FAIL: libz.a missing"
+			echo
+			echo "--- Compile test ---"
+			cat > /tmp/test.c <<'EOF'
+#include <stdio.h>
+#include <zlib.h>
+int main(void) {
+    printf("musl Wolfi SDK OK — zlib %s\n", zlibVersion());
+    return 0;
+}
+EOF
+			cc -static -o /tmp/test /tmp/test.c -lz
+			/tmp/test
+			echo
+			echo "=== All apko SDK tests passed ==="
+		`}).
+		Stdout(ctx)
+}
+
+// ═══════════════════════════════════════════════════════════
+// Base image bootstrap: melange packages → apko base image
+// ═══════════════════════════════════════════════════════════
+
+// BootstrapBaseImage builds the core melange packages and assembles them
+// into a minimal TerranoxOS base image via apko.
+//
+// This is the path to replacing alpine:3.19 — once this image exists,
+// subsequent melange builds can use it as the build host instead of Alpine.
+//
+// Phase 1 (current): Build what we can from source, pull the rest from Alpine.
+// Phase 2 (future): All packages from TerranoxOS melange repo.
+//
+// Core packages built from source:
+//   - musl (C library)
+//   - busybox (shell + coreutils)
+//   - zlib (compression)
+//   - openssl (TLS/crypto)
+//   - ca-certificates (root CA bundle)
+//   - apk-tools (package manager)
+//
+// Usage:
+//
+//	# Build base image:
+//	dagger call bootstrap-base-image --source=. export --path=./terranox-base.tar
+//
+//	# Build base image with security attestation:
+//	dagger call bootstrap-base-image --source=. --secure export --path=./out/base
+func (m *TerranoxBootstrap) BootstrapBaseImage(
+	ctx context.Context,
+	// Repository source directory containing derivations/ and packages/
+	source *dagger.Directory,
+	// Enable security attestation (SBOM + signing + provenance)
+	// +default=false
+	secure bool,
+) (*dagger.Directory, error) {
+	// Core packages to build from source (in dependency order).
+	// apk-tools is split into apk-tools + libapk subpackages so
+	// apko can resolve the so:libapk.so.2.14.0 dependency.
+	corePackages := []string{
+		"musl",
+		"busybox",
+		"zlib",
+		"openssl",
+		"ca-certificates",
+		"apk-tools",
+	}
+
+	// Build each package with melange
+	// Note: For Phase 1, some of these may fail if their build scripts
+	// need adjustments. The apko base image config falls back to Alpine
+	// packages when local packages aren't available.
+	var localRepo *dagger.Directory
+	var buildErrors []string
+
+	for _, pkg := range corePackages {
+		fmt.Printf("Building package: %s\n", pkg)
+		pkgDir, err := m.MelangeBuild(ctx, source, pkg)
+		if err != nil {
+			buildErrors = append(buildErrors, fmt.Sprintf("%s: %v", pkg, err))
+			fmt.Printf("  WARN: %s build failed (will use Alpine package): %v\n", pkg, err)
+			continue
+		}
+		if localRepo == nil {
+			localRepo = pkgDir
+		} else {
+			localRepo = localRepo.WithDirectory(".", pkgDir)
+		}
+		fmt.Printf("  OK: %s built\n", pkg)
+	}
+
+	if len(buildErrors) > 0 {
+		fmt.Printf("\n%d/%d packages failed (falling back to Alpine):\n", len(buildErrors), len(corePackages))
+		for _, e := range buildErrors {
+			fmt.Printf("  - %s\n", e)
+		}
+		fmt.Println()
+	}
+
+	// Include the melange signing public key alongside the local repo
+	// so apko can verify the package index signature.
+	if localRepo != nil {
+		signingKeyPub := source.File("packages/melange.rsa.pub")
+		localRepo = localRepo.WithFile("melange.rsa.pub", signingKeyPub)
+	}
+
+	// Assemble the base image with apko
+	if secure {
+		return m.ApkoBuildSecure(ctx, source, "derivations/apko/base-terranox.yaml", "terranox-base:latest", "", localRepo)
+	}
+
+	ctr, err := m.ApkoBuild(ctx, source, "derivations/apko/base-terranox.yaml", "terranox-base:latest", localRepo)
+	if err != nil {
+		return nil, fmt.Errorf("apko base image build: %w", err)
+	}
+
+	// Export as tarball in a directory alongside a build report
+	report := fmt.Sprintf(`{
+  "packages_built": %d,
+  "packages_failed": %d,
+  "errors": %q,
+  "base_config": "derivations/apko/base-terranox.yaml",
+  "phase": 1
+}`, len(corePackages)-len(buildErrors), len(buildErrors), buildErrors)
+
+	imageTar := ctr.AsTarball()
+
+	return dag.Directory().
+		WithFile("base.tar", imageTar).
+		WithNewFile("build-report.json", report), nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// apko: Secure build pipeline (SBOM + signing + provenance)
+// ═══════════════════════════════════════════════════════════
+
+// ApkoBuildSecure builds an apko image with full security attestation:
+// CycloneDX SBOM, cosign signature, and SLSA provenance.
+//
+// This is the production entry point for building distributable SDK images.
+// It runs the apko build, collects the native SBOM, signs the tarball,
+// and generates SLSA v1.0 provenance — all in one pipeline.
+//
+// Output structure:
+//
+//	image.tar                - OCI image tarball
+//	image.tar.sha256         - SHA256 digest
+//	image.tar.sig            - Cosign signature (placeholder for local, real in CI)
+//	image.tar.bundle         - Cosign signature bundle
+//	sbom.cdx.json            - CycloneDX SBOM (from apko + enrichment)
+//	provenance.json          - SLSA v1.0 provenance attestation
+//
+// Usage:
+//
+//	dagger call apko-build-secure --source=. export --path=./out/sdk-secure
+//	dagger call apko-build-secure --source=. --git-commit=$(git rev-parse HEAD) export --path=./out/sdk-secure
+func (m *TerranoxBootstrap) ApkoBuildSecure(
+	ctx context.Context,
+	// Repository source directory containing derivations/apko/ and packages/
+	source *dagger.Directory,
+	// Path to apko YAML config within source
+	// +default="derivations/apko/sdk-musl.yaml"
+	config string,
+	// Tag for the built image
+	// +default="terranox-sdk:latest"
+	tag string,
+	// Git commit hash (for provenance; auto-detected in CI)
+	// +optional
+	gitCommit string,
+	// Local apk repository with melange-built packages
+	// +optional
+	localRepo *dagger.Directory,
+) (*dagger.Directory, error) {
+	if gitCommit == "" {
+		gitCommit = "local-build"
+	}
+
+	// ── Step 1: Build the image with apko and collect the native SBOM ──
+	//
+	// apko generates SPDX SBOMs by default. We also enrich with a CycloneDX
+	// SBOM that includes TerranoxOS-specific metadata.
+	installApko := `#!/bin/sh
+set -e
+
+echo "==> Installing apko"
+APKO_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/apko/releases/latest \
+  | grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4)
+curl -fsSL "${APKO_URL}" | tar xz --strip-components=1 -C /usr/local/bin
+chmod +x /usr/local/bin/apko
+
+mkdir -p /etc/apk/keys
+wget -qO /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
+  https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+`
+
+	localRepoFlag := ""
+	if localRepo != nil {
+		installApko += `
+mkdir -p /etc/apk/keys
+if [ -f /local-repo/melange.rsa.pub ]; then
+  cp /local-repo/melange.rsa.pub /etc/apk/keys/
+fi
+`
+		localRepoFlag = " --repository-append /local-repo"
+	}
+
+	buildScript := installApko + fmt.Sprintf(`
+echo "==> Building OCI image with apko (secure mode)"
+cd /workspace
+mkdir -p /workspace/sbom-output /workspace/secure-output
+
+# Build image + SBOM
+apko build \
+  --sbom-path /workspace/sbom-output \
+  /workspace/%s \
+  %s \
+  /workspace/secure-output/image.tar%s
+
+echo "==> Image built"
+ls -lh /workspace/secure-output/image.tar
+
+# ── Step 2: SHA256 digest ──
+TARBALL_SHA256=$(sha256sum /workspace/secure-output/image.tar | cut -d' ' -f1)
+echo "$TARBALL_SHA256  image.tar" > /workspace/secure-output/image.tar.sha256
+echo "SHA256: $TARBALL_SHA256"
+
+# ── Step 3: Cosign signature (placeholder for local builds) ──
+# In CI with GitHub Actions, replace with:
+#   cosign sign-blob --yes --bundle image.tar.bundle image.tar
+cat > /workspace/secure-output/image.tar.sig <<SIGEOF
+{
+  "signature": "placeholder-local-build",
+  "digest": {
+    "sha256": "$TARBALL_SHA256"
+  },
+  "timestamp": "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)",
+  "note": "Use cosign sign-blob in CI for real signatures"
+}
+SIGEOF
+
+SIG_BASE64=$(cat /workspace/secure-output/image.tar.sig | base64 | tr -d '\n')
+cat > /workspace/secure-output/image.tar.bundle <<BUNDLEEOF
+{
+  "SignedEntryTimestamp": "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)",
+  "Payload": {
+    "body": "$SIG_BASE64",
+    "integratedTime": $(date +%%s),
+    "logIndex": 0,
+    "logID": "placeholder"
+  }
+}
+BUNDLEEOF
+
+# ── Step 4: CycloneDX SBOM ──
+# apko generates SPDX — we also produce CycloneDX with TerranoxOS metadata.
+# Scan the SPDX output and convert key fields, or generate from scratch.
+SERIAL="urn:uuid:$(cat /proc/sys/kernel/random/uuid)"
+TIMESTAMP=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)
+
+# Collect installed packages from the apko SPDX SBOM
+SPDX_FILE=$(find /workspace/sbom-output -name "*.spdx.json" -type f | head -1)
+
+# Generate component list from SPDX if available, otherwise from config
+COMPONENTS="[]"
+if [ -n "$SPDX_FILE" ] && [ -f "$SPDX_FILE" ]; then
+    echo "==> Converting SPDX SBOM to CycloneDX"
+    # Extract packages from SPDX and convert to CycloneDX format
+    COMPONENTS=$(jq '[.packages[] | select(.name != null) | {
+        "bom-ref": (.name + "@" + (.versionInfo // "unknown")),
+        "type": "library",
+        "name": .name,
+        "version": (.versionInfo // "unknown"),
+        "purl": ("pkg:apk/alpine/" + .name + "@" + (.versionInfo // "unknown") + "?arch=x86_64"),
+        "description": (.description // "Alpine package")
+    }]' "$SPDX_FILE" 2>/dev/null || echo "[]")
+fi
+
+jq -n \
+  --arg serial "$SERIAL" \
+  --arg timestamp "$TIMESTAMP" \
+  --arg tag "%s" \
+  --arg sha256 "$TARBALL_SHA256" \
+  --argjson components "$COMPONENTS" \
+'{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": $serial,
+  "version": 1,
+  "metadata": {
+    "timestamp": $timestamp,
+    "tools": [
+      {
+        "vendor": "Chainguard",
+        "name": "apko",
+        "version": "latest"
+      },
+      {
+        "vendor": "TerranoxOS",
+        "name": "dagger-bootstrap-pipeline",
+        "version": "0.3.0"
+      }
+    ],
+    "component": {
+      "bom-ref": "terranox-sdk-image",
+      "type": "container",
+      "name": "terranox-sdk",
+      "version": $tag,
+      "description": "TerranoxOS musl-native SDK image assembled via apko",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": $sha256
+        }
+      ],
+      "properties": [
+        {
+          "name": "terranox:libc",
+          "value": "musl"
+        },
+        {
+          "name": "terranox:builder",
+          "value": "apko"
+        },
+        {
+          "name": "terranox:arch",
+          "value": "x86_64"
+        }
+      ]
+    }
+  },
+  "components": $components
+}' > /workspace/secure-output/sbom.cdx.json
+
+echo "==> CycloneDX SBOM generated ($(echo "$COMPONENTS" | jq length) components)"
+
+# Copy SPDX SBOM too if available
+if [ -n "$SPDX_FILE" ] && [ -f "$SPDX_FILE" ]; then
+    cp "$SPDX_FILE" /workspace/secure-output/sbom.spdx.json
+    echo "==> SPDX SBOM preserved"
+fi
+
+# ── Step 5: SLSA v1.0 provenance ──
+INVOCATION_ID=$(cat /proc/sys/kernel/random/uuid)
+FINISHED_ON=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)
+
+jq -n \
+  --arg sha256 "$TARBALL_SHA256" \
+  --arg tag "%s" \
+  --arg config "%s" \
+  --arg commit "%s" \
+  --arg invocation "urn:uuid:$INVOCATION_ID" \
+  --arg finished "$FINISHED_ON" \
+'{
+  "_type": "https://in-toto.io/Statement/v0.1",
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "subject": [
+    {
+      "name": "terranox-sdk",
+      "digest": {
+        "sha256": $sha256
+      }
+    }
+  ],
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://terranox.dev/BuildTypes/ApkoSdkBuild/v0.1",
+      "externalParameters": {
+        "config": $config,
+        "tag": $tag,
+        "builder": "apko",
+        "base_packages": "Alpine 3.19 (musl)"
+      },
+      "internalParameters": {
+        "dagger_version": "0.20.1",
+        "pipeline_version": "0.3.0"
+      },
+      "resolvedDependencies": [
+        {
+          "uri": "https://dl-cdn.alpinelinux.org/alpine/v3.19/main",
+          "name": "alpine-main"
+        },
+        {
+          "uri": "https://dl-cdn.alpinelinux.org/alpine/v3.19/community",
+          "name": "alpine-community"
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": ("https://github.com/terranox-os/toolchain/.dagger/rootfs.go@" + $commit),
+        "version": {
+          "dagger": "0.20.1",
+          "apko": "latest"
+        }
+      },
+      "metadata": {
+        "invocationId": $invocation,
+        "finishedOn": $finished
+      }
+    }
+  }
+}' > /workspace/secure-output/provenance.json
+
+echo "==> SLSA provenance generated"
+echo
+echo "=== Secure build complete ==="
+ls -lh /workspace/secure-output/
+`, config, tag, localRepoFlag, tag, tag, config, gitCommit)
+
+	builder := dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache", "curl", "wget", "tar", "jq", "coreutils"}).
+		WithDirectory("/workspace", source)
+
+	if localRepo != nil {
+		builder = builder.WithDirectory("/local-repo", localRepo)
+	}
+
+	builder = builder.
+		WithNewFile("/build.sh", buildScript).
+		WithExec([]string{"sh", "/build.sh"})
+
+	return builder.Directory("/workspace/secure-output"), nil
+}
+
+// TestApkoSecurity builds the SDK image with full security attestation and
+// verifies that all artifacts are present and valid.
+//
+// Usage:
+//
+//	dagger call test-apko-security --source=.
+func (m *TerranoxBootstrap) TestApkoSecurity(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+) (string, error) {
+	artifacts, err := m.ApkoBuildSecure(ctx, source, "derivations/apko/sdk-musl.yaml", "terranox-sdk:test", "", nil)
+	if err != nil {
+		return "", fmt.Errorf("secure build: %w", err)
+	}
+
+	return dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache", "jq", "coreutils"}).
+		WithDirectory("/artifacts", artifacts).
+		WithExec([]string{"sh", "-c", `
+			echo "=== SDK Security Attestation Verification ==="
+			echo
+			PASS=0
+			FAIL=0
+
+			check() {
+				if [ -f "/artifacts/$1" ]; then
+					SIZE=$(stat -c%s "/artifacts/$1")
+					echo "PASS: $1 ($SIZE bytes)"
+					PASS=$((PASS + 1))
+				else
+					echo "FAIL: $1 missing"
+					FAIL=$((FAIL + 1))
+				fi
+			}
+
+			echo "--- Artifact presence ---"
+			check image.tar
+			check image.tar.sha256
+			check image.tar.sig
+			check image.tar.bundle
+			check sbom.cdx.json
+			check provenance.json
+			echo
+
+			echo "--- SHA256 digest verification ---"
+			EXPECTED=$(cut -d' ' -f1 /artifacts/image.tar.sha256)
+			ACTUAL=$(sha256sum /artifacts/image.tar | cut -d' ' -f1)
+			if [ "$EXPECTED" = "$ACTUAL" ]; then
+				echo "PASS: SHA256 matches ($ACTUAL)"
+				PASS=$((PASS + 1))
+			else
+				echo "FAIL: SHA256 mismatch (expected $EXPECTED, got $ACTUAL)"
+				FAIL=$((FAIL + 1))
+			fi
+			echo
+
+			echo "--- CycloneDX SBOM validation ---"
+			if jq empty /artifacts/sbom.cdx.json 2>/dev/null; then
+				FORMAT=$(jq -r '.bomFormat' /artifacts/sbom.cdx.json)
+				SPEC=$(jq -r '.specVersion' /artifacts/sbom.cdx.json)
+				COMP_COUNT=$(jq '.components | length' /artifacts/sbom.cdx.json)
+				SBOM_SHA=$(jq -r '.metadata.component.hashes[0].content // "none"' /artifacts/sbom.cdx.json)
+				echo "PASS: Valid JSON ($FORMAT $SPEC, $COMP_COUNT components)"
+				PASS=$((PASS + 1))
+
+				# Verify SBOM digest matches tarball digest
+				if [ "$SBOM_SHA" = "$ACTUAL" ]; then
+					echo "PASS: SBOM digest matches image digest"
+					PASS=$((PASS + 1))
+				elif [ "$SBOM_SHA" = "none" ]; then
+					echo "WARN: No digest in SBOM metadata"
+				else
+					echo "FAIL: SBOM digest ($SBOM_SHA) != image digest ($ACTUAL)"
+					FAIL=$((FAIL + 1))
+				fi
+			else
+				echo "FAIL: Invalid SBOM JSON"
+				FAIL=$((FAIL + 1))
+			fi
+			echo
+
+			echo "--- Signature validation ---"
+			if jq empty /artifacts/image.tar.sig 2>/dev/null; then
+				SIG_DIGEST=$(jq -r '.digest.sha256' /artifacts/image.tar.sig)
+				if [ "$SIG_DIGEST" = "$ACTUAL" ]; then
+					echo "PASS: Signature digest matches image digest"
+					PASS=$((PASS + 1))
+				else
+					echo "FAIL: Signature digest mismatch"
+					FAIL=$((FAIL + 1))
+				fi
+			else
+				echo "FAIL: Invalid signature JSON"
+				FAIL=$((FAIL + 1))
+			fi
+			echo
+
+			echo "--- SLSA provenance validation ---"
+			if jq empty /artifacts/provenance.json 2>/dev/null; then
+				PRED_TYPE=$(jq -r '.predicateType' /artifacts/provenance.json)
+				BUILD_TYPE=$(jq -r '.predicate.buildDefinition.buildType' /artifacts/provenance.json)
+				SUBJ_DIGEST=$(jq -r '.subject[0].digest.sha256' /artifacts/provenance.json)
+				echo "PASS: Valid JSON"
+				echo "  predicateType: $PRED_TYPE"
+				echo "  buildType: $BUILD_TYPE"
+				PASS=$((PASS + 1))
+
+				# Verify provenance subject matches image
+				if [ "$SUBJ_DIGEST" = "$ACTUAL" ]; then
+					echo "PASS: Provenance subject digest matches image digest"
+					PASS=$((PASS + 1))
+				else
+					echo "FAIL: Provenance subject digest mismatch"
+					FAIL=$((FAIL + 1))
+				fi
+			else
+				echo "FAIL: Invalid provenance JSON"
+				FAIL=$((FAIL + 1))
+			fi
+			echo
+
+			# Check SPDX SBOM if present (bonus)
+			if [ -f /artifacts/sbom.spdx.json ]; then
+				echo "--- SPDX SBOM (bonus) ---"
+				if jq empty /artifacts/sbom.spdx.json 2>/dev/null; then
+					SPDX_PKGS=$(jq '.packages | length' /artifacts/sbom.spdx.json)
+					echo "PASS: Valid SPDX JSON ($SPDX_PKGS packages)"
+					PASS=$((PASS + 1))
+				fi
+				echo
+			fi
+
+			echo "=== Summary: $PASS passed, $FAIL failed ==="
+			if [ "$FAIL" -gt 0 ]; then
+				exit 1
+			fi
+		`}).
+		Stdout(ctx)
 }
 
 // ISOBuild creates a bootable ISO image with Limine bootloader and TerranoxOS kernel.

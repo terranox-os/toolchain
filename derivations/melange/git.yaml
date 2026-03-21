@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Git — distributed version control system.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=git
+
+package:
+  name: git
+  version: 2.47.1
+  epoch: 0
+  description: "Git distributed version control system"
+  copyright:
+    - license: GPL-2.0-only
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - curl-dev
+      - openssl-dev
+      - zlib-dev
+      - expat-dev
+      - pcre2-dev
+      - perl
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.47.1.tar.gz"
+      tar xzf git-2.47.1.tar.gz
+      cd git-2.47.1
+
+      make prefix=/usr \
+        CURL_LDFLAGS="$(curl-config --libs)" \
+        USE_LIBPCRE2=YesPlease \
+        NO_TCLTK=YesPlease \
+        NO_GETTEXT=YesPlease \
+        NO_PERL=YesPlease \
+        NO_PYTHON=YesPlease \
+        NO_NSEC=YesPlease \
+        NO_INSTALL_HARDLINKS=YesPlease \
+        FUZZ_OBJS="" \
+        FUZZ_PROGRAMS="" \
+        -j$(nproc)
+
+      make prefix=/usr \
+        DESTDIR="${{targets.destdir}}" \
+        NO_TCLTK=YesPlease \
+        NO_GETTEXT=YesPlease \
+        NO_PERL=YesPlease \
+        NO_PYTHON=YesPlease \
+        NO_INSTALL_HARDLINKS=YesPlease \
+        FUZZ_PROGRAMS="" \
+        install

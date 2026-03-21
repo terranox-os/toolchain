@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CA certificates bundle — Mozilla's trusted root certificates.
+# Required for any HTTPS communication (apk-tools, curl, wget, git).
+#
+# This is a data-only package — no compilation needed.
+#
+# Build:
+#   dagger call melange-build --source=. --package=ca-certificates
+
+package:
+  name: ca-certificates
+  version: 20240226
+  epoch: 0
+  description: "Mozilla CA certificate bundle"
+  copyright:
+    - license: MPL-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - musl
+      - ca-certificates
+      - openssl
+
+pipeline:
+  - runs: |
+      # Run update-ca-certificates to generate the bundle from individual certs.
+      # Alpine's ca-certificates package installs certs to /usr/share/ca-certificates/
+      # but the trigger that generates the combined bundle doesn't run in the sandbox.
+      update-ca-certificates 2>/dev/null || true
+
+      mkdir -p "${{targets.destdir}}/etc/ssl/certs"
+
+      # Copy the combined bundle (generated or pre-existing)
+      if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp /etc/ssl/certs/ca-certificates.crt \
+          "${{targets.destdir}}/etc/ssl/certs/ca-certificates.crt"
+      else
+        # Fallback: concatenate all individual PEM certs
+        cat /usr/share/ca-certificates/mozilla/*.crt \
+          > "${{targets.destdir}}/etc/ssl/certs/ca-certificates.crt" 2>/dev/null || \
+        cat /etc/ssl/certs/*.pem \
+          > "${{targets.destdir}}/etc/ssl/certs/ca-certificates.crt" 2>/dev/null || \
+        echo "WARNING: no CA certs found"
+      fi
+
+      # Create standard symlinks
+      mkdir -p "${{targets.destdir}}/etc/ssl"
+      ln -sf certs/ca-certificates.crt "${{targets.destdir}}/etc/ssl/cert.pem"

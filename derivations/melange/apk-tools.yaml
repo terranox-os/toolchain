@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# apk-tools — the Alpine Package Keeper. This is the package manager
+# that makes the base image self-hosting: once apk-tools is in the image,
+# it can install more packages from repos without needing apko.
+#
+# Split into subpackages:
+#   apk-tools  — the apk CLI binary (dynamically linked against libapk)
+#   libapk     — the shared library (so:libapk.so.2.14.0)
+#
+# Dependencies: musl, zlib, openssl, ca-certificates
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=apk-tools
+
+package:
+  name: apk-tools
+  version: 2.14.4
+  epoch: 0
+  description: "Alpine Package Keeper — musl-native package manager"
+  copyright:
+    - license: GPL-2.0-only
+  target-architecture:
+    - x86_64
+  checks:
+    disabled:
+      # apk installs to /sbin (standard for system tools)
+      - usrmerge
+  dependencies:
+    runtime:
+      - libapk
+
+subpackages:
+  - name: libapk
+    description: "apk-tools shared library"
+    checks:
+      disabled:
+        - usrmerge
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/lib"
+          # Move the shared library from the main package into the subpackage.
+          # make install puts libapk.so* in $DESTDIR/lib/ (LIBDIR=/lib).
+          mv "${{targets.destdir}}/lib/libapk.so"* "${{targets.subpkgdir}}/lib/"
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - linux-headers
+      - lua5.3
+      - lua5.3-dev
+      - lua5.3-lzlib
+      - openssl-dev
+      - openssl-libs-static
+      - scdoc
+      - wget
+      - zlib-dev
+      - zlib-static
+
+pipeline:
+  - runs: |
+      wget -q "https://gitlab.alpinelinux.org/alpine/apk-tools/-/archive/v2.14.4/apk-tools-v2.14.4.tar.gz"
+      tar xzf apk-tools-v2.14.4.tar.gz
+      cd apk-tools-v2.14.4
+
+      # Build both shared and static targets
+      make -j$(nproc) \
+        CRYPTO="openssl" \
+        LUA="lua5.3"
+
+      make -j$(nproc) \
+        CRYPTO="openssl" \
+        LUA="lua5.3" \
+        STATIC=y
+
+      # Install everything (shared binary, libapk.so, headers, pkg-config)
+      make install \
+        CRYPTO="openssl" \
+        LUA="lua5.3" \
+        DESTDIR="${{targets.destdir}}"
+
+      # Also install the static binary
+      install -m 755 src/apk.static "${{targets.destdir}}/sbin/apk.static"
+
+      # Create standard directories apk expects
+      mkdir -p "${{targets.destdir}}/etc/apk/keys"
+      mkdir -p "${{targets.destdir}}/etc/apk/protected_paths.d"
+      mkdir -p "${{targets.destdir}}/lib/apk/db"
+      mkdir -p "${{targets.destdir}}/var/cache/apk"
+
+      # Don't ship etc/apk/repositories — the base image config (apko YAML)
+      # or the user is responsible for that. Shipping it here conflicts with
+      # alpine-baselayout which also owns this file.
+
+      # Copy Alpine signing keys so apk can verify packages
+      cp /etc/apk/keys/*.pub "${{targets.destdir}}/etc/apk/keys/" 2>/dev/null || true

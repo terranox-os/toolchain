@@ -382,11 +382,11 @@ func (m *TerranoxBootstrap) buildPackageReproducibly(
 		// ── Cache invalidation (ensures fresh build each time) ──
 		WithEnvVariable("BUILD_NUMBER", fmt.Sprintf("%d", buildNumber))
 
-	// Install melange from static binary release (Wolfi packages are glibc-linked, won't run on Alpine)
+	// Install melange from release tarball (Wolfi packages are glibc-linked, won't run on Alpine)
 	ctr = ctr.
 		WithExec([]string{"apk", "add", "--no-cache", "curl", "build-base"}).
 		WithExec([]string{"sh", "-c",
-			"curl -fsSL https://github.com/chainguard-dev/melange/releases/latest/download/melange_linux_amd64 -o /usr/local/bin/melange && chmod +x /usr/local/bin/melange"})
+			`MELANGE_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/melange/releases/latest | grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4) && curl -fsSL "${MELANGE_URL}" | tar xz --strip-components=1 -C /usr/local/bin`})
 
 	// Mount source directory with melange manifests
 	ctr = ctr.

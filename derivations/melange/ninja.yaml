@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ninja — small, fast build system used by CMake and Meson.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=ninja
+
+package:
+  name: ninja
+  version: 1.12.1
+  epoch: 0
+  description: "Ninja small build system"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - python3
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz" -O ninja-1.12.1.tar.gz
+      tar xzf ninja-1.12.1.tar.gz
+      cd ninja-1.12.1
+
+      python3 configure.py --bootstrap
+
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      install -m 755 ninja "${{targets.destdir}}/usr/bin/ninja"

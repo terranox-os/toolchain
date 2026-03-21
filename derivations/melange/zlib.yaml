@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# zlib — compression library. Required by apk-tools, git, openssl, and
+# practically everything else.
+#
+# Build:
+#   dagger call melange-build --source=. --package=zlib
+
+package:
+  name: zlib
+  version: 1.3.1
+  epoch: 0
+  description: "zlib compression library"
+  copyright:
+    - license: Zlib
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.19/main
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - build-base
+      - wget
+
+pipeline:
+  - runs: |
+      wget -q "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
+      echo "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23  zlib-1.3.1.tar.gz" | sha256sum -c
+      tar xzf zlib-1.3.1.tar.gz
+      cd zlib-1.3.1
+
+      # Build both shared and static
+      CFLAGS="-O2 -fPIC" ./configure \
+        --prefix=/usr \
+        --shared
+
+      make -j$(nproc)
+      make DESTDIR="${{targets.destdir}}" install
+
+      # Also build pure static
+      make clean
+      CFLAGS="-O2" ./configure \
+        --prefix=/usr \
+        --static
+
+      make -j$(nproc)
+      install -m 644 libz.a "${{targets.destdir}}/usr/lib/libz.a"

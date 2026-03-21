@@ -60,6 +60,13 @@ cxx_stdlib = "libc++"
 rtlib = "compiler-rt"
 unwindlib = "libunwind"
 
+# ── SDK sysroot ──
+
+[sdk]
+# Alpine packages to install into the SDK sysroot.
+# These are the package names as they appear in Alpine's apk repository.
+packages = ["zlib-dev", "zlib-static", "openssl-dev", "openssl-libs-static", "ncurses-dev", "readline-dev"]
+
 # ── Export paths ──
 
 [export]
