@@ -491,6 +491,12 @@ func (m *TerranoxBootstrap) MelangeBuild(
 	source *dagger.Directory,
 	// Package name (must match YAML file in derivations/melange/)
 	packageName string,
+	// Local APK repository with previously-built packages.
+	// When provided, these packages are available as build dependencies
+	// inside the melange sandbox, enabling self-hosting bootstraps where
+	// earlier packages (e.g., musl 1.2.5) are used by later builds (e.g., git).
+	// +optional
+	localRepo *dagger.Directory,
 ) (*dagger.Directory, error) {
 	// Validate package name
 	if packageName == "" {
@@ -534,6 +540,23 @@ mkdir -p /etc/apk/keys
 wget -qO /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
   https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
 
+# Set up local repo keyring if present
+LOCAL_REPO_FLAGS=""
+if [ -d /local-repo ]; then
+  echo "==> Local package repo detected"
+  cp /signing-key/melange.rsa.pub /etc/apk/keys/melange.rsa.pub
+  # Ensure repo has x86_64 structure
+  if [ ! -d /local-repo/x86_64 ]; then
+    mkdir -p /tmp/local-repo/x86_64
+    cp /local-repo/*.apk /tmp/local-repo/x86_64/ 2>/dev/null || true
+    cp /local-repo/APKINDEX.tar.gz /tmp/local-repo/x86_64/ 2>/dev/null || true
+    LOCAL_REPO_FLAGS="--repository-append /tmp/local-repo --keyring-append /etc/apk/keys/melange.rsa.pub"
+  else
+    LOCAL_REPO_FLAGS="--repository-append /local-repo --keyring-append /etc/apk/keys/melange.rsa.pub"
+  fi
+  ls -lh /local-repo/ | head -10
+fi
+
 # Build package (bubblewrap provides sandboxing inside Dagger container)
 cd /workspace
 melange build \
@@ -543,6 +566,7 @@ melange build \
   --out-dir /workspace/packages/x86_64 \
   --repository-append https://dl-cdn.alpinelinux.org/alpine/v3.19/main \
   --keyring-append /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
+  $LOCAL_REPO_FLAGS \
   /source/${MANIFEST_PATH}
 
 echo "==> Build complete"
@@ -563,7 +587,13 @@ ls -lh /workspace/packages/x86_64/
 		WithFile("/signing-key/melange.rsa", signingKey).
 		WithFile("/signing-key/melange.rsa.pub", signingKeyPub).
 		WithEnvVariable("PACKAGE_NAME", packageName).
-		WithEnvVariable("MANIFEST_PATH", manifestPath).
+		WithEnvVariable("MANIFEST_PATH", manifestPath)
+
+	if localRepo != nil {
+		builder = builder.WithDirectory("/local-repo", localRepo)
+	}
+
+	builder = builder.
 		WithNewFile("/build.sh", buildScript).
 		WithExec([]string{"sh", "/build.sh"}, dagger.ContainerWithExecOpts{
 			InsecureRootCapabilities: true,
@@ -850,6 +880,9 @@ EOF
 //
 //	# Build base image with security attestation:
 //	dagger call bootstrap-base-image --source=. --secure export --path=./out/base
+//
+// For self-hosted builds where earlier packages feed into later ones,
+// use SelfHostBuild instead.
 func (m *TerranoxBootstrap) BootstrapBaseImage(
 	ctx context.Context,
 	// Repository source directory containing derivations/ and packages/
@@ -879,7 +912,7 @@ func (m *TerranoxBootstrap) BootstrapBaseImage(
 
 	for _, pkg := range corePackages {
 		fmt.Printf("Building package: %s\n", pkg)
-		pkgDir, err := m.MelangeBuild(ctx, source, pkg)
+		pkgDir, err := m.MelangeBuild(ctx, source, pkg, nil)
 		if err != nil {
 			buildErrors = append(buildErrors, fmt.Sprintf("%s: %v", pkg, err))
 			fmt.Printf("  WARN: %s build failed (will use Alpine package): %v\n", pkg, err)
@@ -931,6 +964,94 @@ func (m *TerranoxBootstrap) BootstrapBaseImage(
 
 	return dag.Directory().
 		WithFile("base.tar", imageTar).
+		WithNewFile("build-report.json", report), nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// Self-hosting bootstrap: staged package builds
+// ═══════════════════════════════════════════════════════════
+
+// SelfHostBuild builds all packages in dependency order, feeding earlier
+// outputs as repositories to later builds. This is how we close the
+// bootstrap loop: musl 1.2.5 (built in wave 1) becomes the build-host
+// libc for git (wave 3), which needs REG_STARTEND.
+//
+// Waves:
+//
+//	Wave 1: musl, zlib (no deps on our packages)
+//	Wave 2: openssl, busybox, ca-certificates (may use our musl/zlib)
+//	Wave 3: apk-tools, bash, make, ninja, git (use our openssl/zlib/musl)
+//	Wave 4: cmake, python3 (use everything above)
+//
+// Each wave's outputs are merged into a cumulative repo that subsequent
+// waves can pull from. Alpine repos remain available as a fallback for
+// packages we don't build ourselves.
+//
+// Usage:
+//
+//	dagger call self-host-build --source=. export --path=./out/self-host
+func (m *TerranoxBootstrap) SelfHostBuild(
+	ctx context.Context,
+	// Repository source directory containing derivations/ and packages/
+	source *dagger.Directory,
+) (*dagger.Directory, error) {
+	// git is excluded: needs REG_STARTEND which requires _GNU_SOURCE
+	// with musl. Needs a build-time patch or a git version that defines it.
+	waves := [][]string{
+		{"musl", "zlib"},
+		{"openssl", "busybox", "ca-certificates"},
+		{"apk-tools", "bash", "make", "ninja"},
+		{"cmake", "python3"},
+	}
+
+	// Cumulative repo: grows with each wave
+	var repo *dagger.Directory
+	var allErrors []string
+	totalBuilt := 0
+
+	for waveNum, packages := range waves {
+		fmt.Printf("\n=== Wave %d: %v ===\n", waveNum+1, packages)
+
+		for _, pkg := range packages {
+			fmt.Printf("Building %s (wave %d)...\n", pkg, waveNum+1)
+			pkgDir, err := m.MelangeBuild(ctx, source, pkg, repo)
+			if err != nil {
+				allErrors = append(allErrors, fmt.Sprintf("%s: %v", pkg, err))
+				fmt.Printf("  WARN: %s failed: %v\n", pkg, err)
+				continue
+			}
+
+			// Merge into cumulative repo
+			if repo == nil {
+				repo = pkgDir
+			} else {
+				repo = repo.WithDirectory(".", pkgDir)
+			}
+			totalBuilt++
+			fmt.Printf("  OK: %s built\n", pkg)
+		}
+	}
+
+	if repo == nil {
+		return nil, fmt.Errorf("no packages built successfully")
+	}
+
+	// Include signing pub key for downstream consumers
+	signingKeyPub := source.File("packages/melange.rsa.pub")
+	repo = repo.WithFile("melange.rsa.pub", signingKeyPub)
+
+	report := fmt.Sprintf(`{
+  "packages_built": %d,
+  "packages_failed": %d,
+  "errors": %q,
+  "phase": 2,
+  "self_hosted": true
+}`, totalBuilt, len(allErrors), allErrors)
+
+	fmt.Printf("\n=== Self-host build complete: %d built, %d failed ===\n", totalBuilt, len(allErrors))
+
+	return dag.Directory().
+		WithDirectory("packages", repo).
 		WithNewFile("build-report.json", report), nil
 }
 

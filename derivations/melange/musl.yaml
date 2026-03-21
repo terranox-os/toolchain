@@ -52,3 +52,33 @@ pipeline:
       # Dynamic linker symlink
       mkdir -p "${{targets.destdir}}/lib"
       ln -sf /usr/lib/libc.so "${{targets.destdir}}/lib/ld-musl-x86_64.so.1"
+
+      # Build libssp_nonshared.a — Alpine's GCC expects this in musl-dev.
+      # It provides __stack_chk_fail_local for -fstack-protector.
+      cat > /tmp/ssp_nonshared.c <<'SSPEOF'
+      extern void __stack_chk_fail(void);
+      void __attribute__((visibility("hidden"))) __stack_chk_fail_local(void) {
+          __stack_chk_fail();
+      }
+      SSPEOF
+      gcc -c -O2 -fPIC -o /tmp/ssp_nonshared.o /tmp/ssp_nonshared.c
+      ar rcs "${{targets.destdir}}/usr/lib/libssp_nonshared.a" /tmp/ssp_nonshared.o
+
+subpackages:
+  - name: musl-dev
+    description: "musl C library development headers and static libs"
+    dependencies:
+      runtime:
+        - musl
+    pipeline:
+      - runs: |
+          # Move headers and static libs from main package into -dev subpackage
+          mkdir -p "${{targets.subpkgdir}}/usr/include"
+          mkdir -p "${{targets.subpkgdir}}/usr/lib"
+
+          mv "${{targets.destdir}}/usr/include"/* "${{targets.subpkgdir}}/usr/include/"
+          mv "${{targets.destdir}}/usr/lib"/*.a "${{targets.subpkgdir}}/usr/lib/" 2>/dev/null || true
+          mv "${{targets.destdir}}/usr/lib"/*.o "${{targets.subpkgdir}}/usr/lib/" 2>/dev/null || true
+
+          # musl-dev also needs the .specs file and libc.so linker script
+          mv "${{targets.destdir}}/usr/lib/musl-gcc.specs" "${{targets.subpkgdir}}/usr/lib/" 2>/dev/null || true
