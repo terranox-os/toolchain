@@ -34,6 +34,7 @@ environment:
       - expat-dev
       - pcre2-dev
       - perl
+      - autoconf
       - wget
 
 pipeline:
@@ -42,8 +43,15 @@ pipeline:
       tar xzf git-2.47.1.tar.gz
       cd git-2.47.1
 
-      make prefix=/usr \
-        CURL_LDFLAGS="$(curl-config --libs)" \
+      # musl hides REG_STARTEND behind _GNU_SOURCE. Use autoconf to
+      # detect it properly, then build with the generated config.
+      make configure
+      ./configure \
+        --prefix=/usr \
+        CFLAGS="-O2 -D_GNU_SOURCE" \
+        CPPFLAGS="-D_GNU_SOURCE"
+
+      make \
         USE_LIBPCRE2=YesPlease \
         NO_TCLTK=YesPlease \
         NO_GETTEXT=YesPlease \
@@ -51,16 +59,13 @@ pipeline:
         NO_PYTHON=YesPlease \
         NO_NSEC=YesPlease \
         NO_INSTALL_HARDLINKS=YesPlease \
-        FUZZ_OBJS="" \
-        FUZZ_PROGRAMS="" \
         -j$(nproc)
 
-      make prefix=/usr \
+      make \
         DESTDIR="${{targets.destdir}}" \
         NO_TCLTK=YesPlease \
         NO_GETTEXT=YesPlease \
         NO_PERL=YesPlease \
         NO_PYTHON=YesPlease \
         NO_INSTALL_HARDLINKS=YesPlease \
-        FUZZ_PROGRAMS="" \
         install

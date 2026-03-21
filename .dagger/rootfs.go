@@ -995,12 +995,10 @@ func (m *TerranoxBootstrap) SelfHostBuild(
 	// Repository source directory containing derivations/ and packages/
 	source *dagger.Directory,
 ) (*dagger.Directory, error) {
-	// git is excluded: needs REG_STARTEND which requires _GNU_SOURCE
-	// with musl. Needs a build-time patch or a git version that defines it.
 	waves := [][]string{
 		{"musl", "zlib"},
 		{"openssl", "busybox", "ca-certificates"},
-		{"apk-tools", "bash", "make", "ninja"},
+		{"apk-tools", "bash", "make", "ninja", "git"},
 		{"cmake", "python3"},
 	}
 
