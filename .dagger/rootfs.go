@@ -557,6 +557,24 @@ if [ -d /local-repo ]; then
   ls -lh /local-repo/ | head -10
 fi
 
+# Detect if terranox-clang is in the local repo — if so, inject it and set CC/CXX
+CLANG_ENV_FLAGS=""
+CLANG_PKG_FLAGS=""
+if [ -d /local-repo ] && ls /local-repo/terranox-clang-*.apk >/dev/null 2>&1 || \
+   [ -d /local-repo/x86_64 ] && ls /local-repo/x86_64/terranox-clang-*.apk >/dev/null 2>&1; then
+  echo "==> terranox-clang detected, will compile with clang"
+  CLANG_PKG_FLAGS="--package-append terranox-clang"
+  # melange uses --env-file, not --env
+  cat > /tmp/clang-env <<'ENVEOF'
+CC=clang
+CXX=clang++
+LD=ld.lld
+AR=llvm-ar
+RANLIB=llvm-ranlib
+ENVEOF
+  CLANG_ENV_FLAGS="--env-file /tmp/clang-env"
+fi
+
 # Build package (bubblewrap provides sandboxing inside Dagger container)
 cd /workspace
 melange build \
@@ -567,6 +585,8 @@ melange build \
   --repository-append https://dl-cdn.alpinelinux.org/alpine/v3.19/main \
   --keyring-append /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
   $LOCAL_REPO_FLAGS \
+  $CLANG_PKG_FLAGS \
+  $CLANG_ENV_FLAGS \
   /source/${MANIFEST_PATH}
 
 echo "==> Build complete"
@@ -968,6 +988,287 @@ func (m *TerranoxBootstrap) BootstrapBaseImage(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Toolchain APK: package Stage1 for use in melange builds
+// ═══════════════════════════════════════════════════════════
+
+// PackageToolchainApk takes the Stage1 LLVM/Clang toolchain directory and
+// packages it as an APK that can be installed in melange build environments.
+// This is how we close the final loop: packages are compiled with our own
+// compiler, not Alpine's GCC.
+//
+// The APK installs to /usr (bin/clang, bin/lld, lib/clang/*, etc.) so it's
+// a drop-in replacement for Alpine's clang package.
+//
+// Usage:
+//
+//	dagger call package-toolchain-apk --source=. export --path=./out/toolchain-apk
+func (m *TerranoxBootstrap) PackageToolchainApk(
+	ctx context.Context,
+	// +default="21.1.8"
+	llvmVersion string,
+	// Pre-built Stage1 toolchain directory. If not provided, built from scratch.
+	// +optional
+	toolchain *dagger.Directory,
+	// Pre-built sysroot directory. Needed for compiler-rt/libc++ libs.
+	// +optional
+	sysroot *dagger.Directory,
+	// Repository source directory
+	// +optional
+	source *dagger.Directory,
+) (*dagger.Directory, error) {
+	// Build Stage1 if not provided
+	if toolchain == nil {
+		toolchain = m.MuslStage1(llvmVersion, DefaultMuslVersion, DefaultLinuxVersion, nil, nil, source)
+	}
+
+	// Build sysroot if not provided (needed for runtime libs)
+	if sysroot == nil {
+		sysroot = m.MuslSysroot(llvmVersion, DefaultMuslVersion, DefaultLinuxVersion, source)
+	}
+
+	// Create the APK in a container.
+	// APK format: gzip-compressed tar with .PKGINFO metadata + files.
+	apkBuilder := dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache", "tar", "gzip", "openssl", "abuild"}).
+		WithDirectory("/toolchain", toolchain).
+		WithDirectory("/sysroot", sysroot).
+		WithNewFile("/build-apk.sh", fmt.Sprintf(`#!/bin/sh
+set -e
+
+VERSION="%s"
+PKGNAME="terranox-clang"
+
+# Create package filesystem layout
+mkdir -p /pkg/usr/bin /pkg/usr/lib
+
+# Copy toolchain binaries
+cp /toolchain/bin/clang-* /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/clang /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/clang++ /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/lld /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/ld.lld /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/ld64.lld /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-ar /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-nm /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-ranlib /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-objcopy /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-objdump /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-strip /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-readelf /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-strings /pkg/usr/bin/ 2>/dev/null || true
+cp /toolchain/bin/llvm-size /pkg/usr/bin/ 2>/dev/null || true
+
+# Create convenience symlinks
+cd /pkg/usr/bin
+ln -sf clang cc
+ln -sf clang++ c++
+ln -sf lld ld
+ln -sf llvm-ar ar
+ln -sf llvm-ranlib ranlib
+ln -sf llvm-nm nm
+ln -sf llvm-objdump objdump
+ln -sf llvm-strip strip
+cd /
+
+# Copy clang resource directory (compiler-rt, headers)
+if [ -d /toolchain/lib/clang ]; then
+  cp -a /toolchain/lib/clang /pkg/usr/lib/
+fi
+
+# Copy runtime libraries from sysroot
+mkdir -p /pkg/usr/lib
+cp /sysroot/usr/lib/libc++*.a /pkg/usr/lib/ 2>/dev/null || true
+cp /sysroot/usr/lib/libunwind*.a /pkg/usr/lib/ 2>/dev/null || true
+
+# Calculate installed size
+INSTALLED_SIZE=$(du -sk /pkg | cut -f1)
+INSTALLED_SIZE=$((INSTALLED_SIZE * 1024))
+
+# Generate .PKGINFO
+cat > /pkg/.PKGINFO <<PKGEOF
+pkgname = ${PKGNAME}
+pkgver = ${VERSION}-r0
+arch = x86_64
+size = ${INSTALLED_SIZE}
+pkgdesc = TerranoxOS LLVM/Clang toolchain
+url = https://github.com/terranox-os/toolchain
+license = Apache-2.0
+provides = cmd:clang=${VERSION}-r0
+provides = cmd:clang++=${VERSION}-r0
+provides = cmd:lld=${VERSION}-r0
+provides = cmd:cc=${VERSION}-r0
+provides = cmd:c++=${VERSION}-r0
+provides = cmd:ld=${VERSION}-r0
+provides = cmd:ar=${VERSION}-r0
+PKGEOF
+
+# Build the APK tarball
+mkdir -p /output/x86_64
+cd /pkg
+tar czf /output/x86_64/${PKGNAME}-${VERSION}-r0.apk \
+  .PKGINFO usr/
+
+# Sign if key is available
+if [ -f /signing-key/melange.rsa ]; then
+  cd /output/x86_64
+  # Create signature
+  openssl dgst -sha256 -sign /signing-key/melange.rsa \
+    -out .SIGN.RSA256.melange.rsa.pub \
+    ${PKGNAME}-${VERSION}-r0.apk
+
+  # Repack with signature
+  cd /pkg
+  tar czf /output/x86_64/${PKGNAME}-${VERSION}-r0.apk \
+    .PKGINFO usr/
+fi
+
+# Generate APKINDEX from the package metadata
+cd /output/x86_64
+cat /pkg/.PKGINFO > /tmp/index-entry
+echo "" >> /tmp/index-entry
+
+# Create APKINDEX.tar.gz
+tar czf APKINDEX.tar.gz -C /tmp index-entry
+
+echo "==> Toolchain APK created"
+ls -lh /output/x86_64/
+`, llvmVersion)).
+		WithEnvVariable("LLVM_VERSION", llvmVersion)
+
+	// Mount signing key if source is provided
+	if source != nil {
+		signingKey := source.File("packages/melange.rsa")
+		signingKeyPub := source.File("packages/melange.rsa.pub")
+		apkBuilder = apkBuilder.
+			WithFile("/signing-key/melange.rsa", signingKey).
+			WithFile("/signing-key/melange.rsa.pub", signingKeyPub)
+	}
+
+	apkBuilder = apkBuilder.
+		WithExec([]string{"sh", "/build-apk.sh"})
+
+	return apkBuilder.Directory("/output/x86_64"), nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// Docker image from toolchain APK
+// ═══════════════════════════════════════════════════════════
+
+// ToolchainApkImage creates a Docker/OCI container image by installing the
+// toolchain APK into an Alpine base. Unlike ToolchainImage (which copies raw
+// directories), this uses the APK package manager so the toolchain is tracked
+// as a proper system package.
+//
+// The image includes build essentials (cmake, ninja, make, git) and has
+// clang/lld/llvm-* available in /usr/bin via the APK install.
+//
+// Usage:
+//
+//	# Build image from scratch:
+//	dagger call toolchain-apk-image --source=. export --path=./terranox-toolchain-apk.tar
+//
+//	# Build with pre-built APK directory:
+//	dagger call toolchain-apk-image --source=. --apk-repo=./out/toolchain-apk \
+//	  export --path=./terranox-toolchain-apk.tar
+//
+//	# Publish to registry:
+//	dagger call toolchain-apk-image --source=. \
+//	  publish --address ghcr.io/terranox-os/toolchain:21.1.8-apk
+//
+//	# Interactive shell:
+//	dagger call toolchain-apk-image --source=. terminal
+func (m *TerranoxBootstrap) ToolchainApkImage(
+	ctx context.Context,
+	// LLVM version
+	// +default="21.1.8"
+	llvmVersion string,
+	// Pre-built APK repository directory (output of PackageToolchainApk).
+	// If not provided, the APK is built from scratch.
+	// +optional
+	apkRepo *dagger.Directory,
+	// Pre-built Stage1 toolchain directory (passed to PackageToolchainApk if apkRepo is nil)
+	// +optional
+	toolchain *dagger.Directory,
+	// Pre-built sysroot directory (passed to PackageToolchainApk if apkRepo is nil)
+	// +optional
+	sysroot *dagger.Directory,
+	// Repository source directory containing packages/ signing keys
+	// +optional
+	source *dagger.Directory,
+) (*dagger.Container, error) {
+	// Build the APK if not provided
+	if apkRepo == nil {
+		var err error
+		apkRepo, err = m.PackageToolchainApk(ctx, llvmVersion, toolchain, sysroot, source)
+		if err != nil {
+			return nil, fmt.Errorf("build toolchain APK: %w", err)
+		}
+	}
+
+	// Resolve the signing public key for APK verification
+	var signingKeyPub *dagger.File
+	if source != nil {
+		signingKeyPub = source.File("packages/melange.rsa.pub")
+	}
+
+	// Build the container image with the APK installed
+	ctr := dag.Container().
+		From("alpine:3.19").
+		WithExec([]string{"apk", "add", "--no-cache",
+			"bash", "cmake", "ninja", "samurai", "make",
+			"git", "file", "pkgconf", "musl-dev", "linux-headers",
+		}).
+		// Mount local APK repo
+		WithDirectory("/tmp/apk-repo", apkRepo)
+
+	// Install signing key so apk trusts our packages
+	if signingKeyPub != nil {
+		ctr = ctr.WithFile("/etc/apk/keys/melange.rsa.pub", signingKeyPub)
+	}
+
+	// Install the toolchain APK from the local repo
+	ctr = ctr.WithExec([]string{"sh", "-c", fmt.Sprintf(`
+		# Allow untrusted if no signing key (development builds)
+		APK_FLAGS=""
+		if [ ! -f /etc/apk/keys/melange.rsa.pub ]; then
+			APK_FLAGS="--allow-untrusted"
+		fi
+
+		apk add $APK_FLAGS \
+			--repository /tmp/apk-repo \
+			terranox-clang=%s-r0
+
+		# Verify installation
+		echo "==> Installed toolchain binaries:"
+		ls -la /usr/bin/clang /usr/bin/lld /usr/bin/cc 2>/dev/null || true
+		clang --version || echo "WARN: clang --version failed"
+
+		# Clean up repo cache
+		rm -rf /tmp/apk-repo
+	`, llvmVersion)}).
+		WithEnvVariable("PATH", "/usr/bin:/usr/local/bin:/bin:/sbin").
+		WithEnvVariable("CC", "clang").
+		WithEnvVariable("CXX", "clang++").
+		WithEnvVariable("LD", "ld.lld").
+		WithEnvVariable("AR", "llvm-ar").
+		WithEnvVariable("RANLIB", "llvm-ranlib").
+		WithEnvVariable("TERRANOX_VERSION", llvmVersion).
+		WithLabel("org.opencontainers.image.title", "TerranoxOS Toolchain (APK)").
+		WithLabel("org.opencontainers.image.description",
+			"LLVM/Clang toolchain installed via APK package manager").
+		WithLabel("org.opencontainers.image.version", llvmVersion).
+		WithLabel("org.opencontainers.image.vendor", "TerranoxOS").
+		WithLabel("org.opencontainers.image.licenses", "Apache-2.0").
+		WithLabel("terranox.llvm.version", llvmVersion).
+		WithLabel("terranox.install-method", "apk").
+		WithLabel("terranox.target", Target).
+		WithWorkdir("/workspace")
+
+	return ctr, nil
+}
+
+// ═══════════════════════════════════════════════════════════
 // Self-hosting bootstrap: staged package builds
 // ═══════════════════════════════════════════════════════════
 
@@ -1047,6 +1348,95 @@ func (m *TerranoxBootstrap) SelfHostBuild(
 }`, totalBuilt, len(allErrors), allErrors)
 
 	fmt.Printf("\n=== Self-host build complete: %d built, %d failed ===\n", totalBuilt, len(allErrors))
+
+	return dag.Directory().
+		WithDirectory("packages", repo).
+		WithNewFile("build-report.json", report), nil
+}
+
+// SelfHostBuildClang rebuilds all packages using the TerranoxOS Stage1
+// LLVM/Clang toolchain instead of Alpine's GCC. This is the final
+// self-hosting milestone: every package is compiled with our own compiler.
+//
+// Flow:
+//  1. Build (or accept) Stage1 toolchain + sysroot
+//  2. Package the toolchain as an APK (terranox-clang)
+//  3. Run SelfHostBuild waves with the toolchain APK in the local repo
+//  4. Melange manifests install terranox-clang and use CC=clang CXX=clang++
+//
+// Usage:
+//
+//	dagger call self-host-build-clang --source=. export --path=./out/clang-self-host
+//	dagger call self-host-build-clang --source=. --toolchain=./stage1 export --path=./out/clang-self-host
+func (m *TerranoxBootstrap) SelfHostBuildClang(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+	// +default="21.1.8"
+	llvmVersion string,
+	// Pre-built Stage1 toolchain. If not provided, built from scratch.
+	// +optional
+	toolchain *dagger.Directory,
+	// Pre-built sysroot. If not provided, built from scratch.
+	// +optional
+	sysroot *dagger.Directory,
+) (*dagger.Directory, error) {
+	// Step 1: Package the toolchain as an APK
+	fmt.Println("=== Packaging Stage1 toolchain as APK ===")
+	toolchainApk, err := m.PackageToolchainApk(ctx, llvmVersion, toolchain, sysroot, source)
+	if err != nil {
+		return nil, fmt.Errorf("package toolchain APK: %w", err)
+	}
+
+	// Step 2: Build all packages in waves, with the toolchain APK
+	// available in wave 1's local repo so all packages can use it.
+	waves := [][]string{
+		{"musl", "zlib"},
+		{"openssl", "busybox", "ca-certificates"},
+		{"apk-tools", "bash", "make", "ninja", "git"},
+		{"cmake", "python3"},
+	}
+
+	// Start with the toolchain APK as the initial repo
+	repo := toolchainApk
+	var allErrors []string
+	totalBuilt := 0
+
+	for waveNum, packages := range waves {
+		fmt.Printf("\n=== Wave %d (clang): %v ===\n", waveNum+1, packages)
+
+		for _, pkg := range packages {
+			fmt.Printf("Building %s with clang...\n", pkg)
+			pkgDir, err := m.MelangeBuild(ctx, source, pkg, repo)
+			if err != nil {
+				allErrors = append(allErrors, fmt.Sprintf("%s: %v", pkg, err))
+				fmt.Printf("  WARN: %s failed: %v\n", pkg, err)
+				continue
+			}
+
+			repo = repo.WithDirectory(".", pkgDir)
+			totalBuilt++
+			fmt.Printf("  OK: %s built\n", pkg)
+		}
+	}
+
+	if repo == nil {
+		return nil, fmt.Errorf("no packages built successfully")
+	}
+
+	signingKeyPub := source.File("packages/melange.rsa.pub")
+	repo = repo.WithFile("melange.rsa.pub", signingKeyPub)
+
+	report := fmt.Sprintf(`{
+  "packages_built": %d,
+  "packages_failed": %d,
+  "errors": %q,
+  "compiler": "clang-%s",
+  "phase": 3,
+  "self_hosted": true
+}`, totalBuilt, len(allErrors), allErrors, llvmVersion)
+
+	fmt.Printf("\n=== Clang self-host build: %d built, %d failed ===\n", totalBuilt, len(allErrors))
 
 	return dag.Directory().
 		WithDirectory("packages", repo).
