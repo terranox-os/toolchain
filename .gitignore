@@ -9,3 +9,7 @@
 
 # Go
 .dagger/vendor/
+
+# Signing keys
+*.rsa
+*.rsa.pub
