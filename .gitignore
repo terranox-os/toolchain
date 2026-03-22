@@ -13,3 +13,4 @@
 # Signing keys
 *.rsa
 *.rsa.pub
+build/

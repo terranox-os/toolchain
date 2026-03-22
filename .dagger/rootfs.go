@@ -641,11 +641,16 @@ ls -lh /workspace/packages/x86_64/
 func (m *TerranoxBootstrap) MelangeKeygen() *dagger.Directory {
 	return dag.Container().
 		From("alpine:3.19").
-		WithExec([]string{"apk", "add", "--no-cache", "openssl"}).
+		WithExec([]string{"apk", "add", "--no-cache", "curl"}).
 		WithExec([]string{"sh", "-c", `
 			mkdir -p /out
-			openssl genrsa -out /out/melange.rsa 4096
-			openssl rsa -in /out/melange.rsa -pubout -out /out/melange.rsa.pub
+			# Download and install melange
+			MELANGE_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/melange/releases/latest \
+				| grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4)
+			curl -fsSL "${MELANGE_URL}" | tar xz --strip-components=1 -C /usr/local/bin
+
+			# Use melange's own keygen (generates correct format)
+			melange keygen /out/melange.rsa
 			chmod 600 /out/melange.rsa
 		`}).
 		Directory("/out")
