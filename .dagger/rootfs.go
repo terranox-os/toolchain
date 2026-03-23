@@ -1686,11 +1686,9 @@ func (m *TerranoxBootstrap) TestToolchainImage(
 		}
 	}
 
-	// The apko image needs the dynamic linker as entrypoint
-	// because the default entrypoint may not resolve correctly.
-	ctr = ctr.
-		WithEntrypoint([]string{"/lib/ld-musl-x86_64.so.1"}).
-		WithExec([]string{"/bin/sh", "-c", "true"})
+	// Override the apko entrypoint (/bin/bash) so Dagger's WithExec
+	// runs commands directly rather than as bash arguments.
+	ctr = ctr.WithEntrypoint(nil)
 
 	return ctr.
 		WithNewFile("/tmp/hello.c", `
