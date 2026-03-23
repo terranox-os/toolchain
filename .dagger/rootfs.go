@@ -1653,6 +1653,221 @@ func (m *TerranoxBootstrap) BuildToolchainImage(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Toolchain image smoke test
+// ═══════════════════════════════════════════════════════════
+
+// TestToolchainImage runs a comprehensive smoke test on the toolchain
+// container image. Tests C compilation, C++ compilation, LLVM tools,
+// build tools, and verifies the sysroot + clang config are wired correctly.
+//
+// Usage:
+//
+//	# Test after building:
+//	dagger call test-toolchain-image --source=.
+//
+//	# Test a pre-built image tarball:
+//	dagger call test-toolchain-image --source=. --image-tar=./terranox-toolchain.tar
+func (m *TerranoxBootstrap) TestToolchainImage(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+	// Pre-built OCI tarball. If not provided, builds the image from scratch.
+	// +optional
+	imageTar *dagger.File,
+) (string, error) {
+	var ctr *dagger.Container
+	if imageTar != nil {
+		ctr = dag.Container().Import(imageTar)
+	} else {
+		var err error
+		ctr, err = m.BuildToolchainImage(ctx, source, nil, nil, nil)
+		if err != nil {
+			return "", fmt.Errorf("build toolchain image: %w", err)
+		}
+	}
+
+	// The apko image needs the dynamic linker as entrypoint
+	// because the default entrypoint may not resolve correctly.
+	ctr = ctr.
+		WithEntrypoint([]string{"/lib/ld-musl-x86_64.so.1"}).
+		WithExec([]string{"/bin/sh", "-c", "true"})
+
+	return ctr.
+		WithNewFile("/tmp/hello.c", `
+#include <stdio.h>
+int main(void) {
+    printf("Hello from TerranoxOS Clang!\n");
+    #ifdef __terranox__
+    printf("__terranox__ macro defined\n");
+    #endif
+    return 0;
+}
+`).
+		WithNewFile("/tmp/hello.cpp", `
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+int main() {
+    std::vector<int> v = {3, 1, 4, 1, 5, 9, 2, 6};
+    std::sort(v.begin(), v.end());
+    int sum = std::accumulate(v.begin(), v.end(), 0);
+    std::cout << "Sorted: ";
+    for (int x : v) std::cout << x << " ";
+    std::cout << "\nSum: " << sum << std::endl;
+    return 0;
+}
+`).
+		WithNewFile("/tmp/multifile_a.c", `
+#include <stdio.h>
+extern int get_value(void);
+int main(void) {
+    printf("Value: %d\n", get_value());
+    return 0;
+}
+`).
+		WithNewFile("/tmp/multifile_b.c", `
+int get_value(void) { return 42; }
+`).
+		WithExec([]string{"/bin/sh", "-c", `
+set -e
+PASS=0
+FAIL=0
+check_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+check_fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+
+echo "═══════════════════════════════════════════════════════"
+echo "  TerranoxOS Toolchain Image Test"
+echo "═══════════════════════════════════════════════════════"
+echo
+
+# ── Compiler info ──
+echo "--- Compiler ---"
+CLANG_VER=$(clang --version | head -1)
+echo "$CLANG_VER"
+clang -dumpmachine
+echo
+
+# ── Test 1: C compilation ──
+echo "--- Test 1: C compilation ---"
+if clang -o /tmp/hello /tmp/hello.c 2>&1; then
+  OUTPUT=$(/tmp/hello)
+  echo "$OUTPUT"
+  if echo "$OUTPUT" | grep -q "Hello from TerranoxOS"; then
+    check_pass "C compilation and execution"
+  else
+    check_fail "C binary ran but wrong output"
+  fi
+else
+  check_fail "C compilation"
+fi
+echo
+
+# ── Test 2: C++ compilation ──
+echo "--- Test 2: C++ compilation ---"
+if clang++ -o /tmp/hellocpp /tmp/hello.cpp 2>&1; then
+  OUTPUT=$(/tmp/hellocpp)
+  echo "$OUTPUT"
+  if echo "$OUTPUT" | grep -q "Sum: 31"; then
+    check_pass "C++ compilation and execution"
+  else
+    check_fail "C++ binary ran but wrong output"
+  fi
+else
+  check_fail "C++ compilation"
+fi
+echo
+
+# ── Test 3: Multi-file compilation ──
+echo "--- Test 3: Multi-file compilation ---"
+if clang -c -o /tmp/a.o /tmp/multifile_a.c && \
+   clang -c -o /tmp/b.o /tmp/multifile_b.c && \
+   clang -o /tmp/multifile /tmp/a.o /tmp/b.o 2>&1; then
+  OUTPUT=$(/tmp/multifile)
+  if echo "$OUTPUT" | grep -q "Value: 42"; then
+    check_pass "multi-file C compilation"
+  else
+    check_fail "multi-file binary wrong output"
+  fi
+else
+  check_fail "multi-file C compilation"
+fi
+echo
+
+# ── Test 4: LLD linker ──
+echo "--- Test 4: LLD ---"
+if ld.lld --version 2>&1 | grep -q "LLD"; then
+  check_pass "ld.lld available"
+else
+  check_fail "ld.lld not found"
+fi
+echo
+
+# ── Test 5: LLVM tools ──
+echo "--- Test 5: LLVM tools ---"
+for tool in llvm-ar llvm-nm llvm-objdump llvm-strip llvm-ranlib llvm-readelf llvm-size llvm-strings; do
+  if command -v $tool >/dev/null 2>&1; then
+    check_pass "$tool"
+  else
+    check_fail "$tool not found"
+  fi
+done
+echo
+
+# ── Test 6: Convenience symlinks ──
+echo "--- Test 6: Convenience symlinks ---"
+for sym in cc c++ ld ar nm strip ranlib objdump; do
+  if command -v $sym >/dev/null 2>&1; then
+    check_pass "$sym symlink"
+  else
+    check_fail "$sym symlink not found"
+  fi
+done
+echo
+
+# ── Test 7: Build tools ──
+echo "--- Test 7: Build tools ---"
+cmake --version 2>&1 | head -1 && check_pass "cmake" || check_fail "cmake"
+ninja --version 2>&1 && check_pass "ninja" || check_fail "ninja"
+make --version 2>&1 | head -1 && check_pass "make" || check_fail "make"
+git --version 2>&1 && check_pass "git" || check_fail "git"
+python3 --version 2>&1 && check_pass "python3" || check_fail "python3"
+echo
+
+# ── Test 8: Sysroot integrity ──
+echo "--- Test 8: Sysroot ---"
+SYSROOT=/usr/share/terranox-sysroot
+[ -f $SYSROOT/usr/include/stdio.h ] && check_pass "musl headers" || check_fail "musl headers missing"
+[ -f $SYSROOT/usr/lib/libc.a ] && check_pass "musl libc.a" || check_fail "musl libc.a missing"
+[ -f $SYSROOT/usr/lib/libc++_real.a ] && check_pass "libc++.a" || check_fail "libc++.a missing"
+[ -f $SYSROOT/usr/lib/libc++abi.a ] && check_pass "libc++abi.a" || check_fail "libc++abi.a missing"
+[ -f $SYSROOT/usr/lib/libunwind.a ] && check_pass "libunwind.a" || check_fail "libunwind.a missing"
+[ -f $SYSROOT/usr/include/c++/v1/iostream ] && check_pass "libc++ headers" || check_fail "libc++ headers missing"
+echo
+
+# ── Test 9: Binary inspection ──
+echo "--- Test 9: Binary properties ---"
+file /tmp/hello | grep -q "ELF 64-bit" && check_pass "ELF 64-bit binary" || check_fail "not ELF 64-bit"
+file /tmp/hello | grep -q "musl" && check_pass "musl-linked" || check_fail "not musl-linked"
+llvm-readelf -d /tmp/hello 2>/dev/null | grep -q "NEEDED" && check_pass "dynamic binary" || check_fail "readelf failed"
+echo
+
+# ── Summary ──
+echo "═══════════════════════════════════════════════════════"
+TOTAL=$((PASS + FAIL))
+printf "RESULT: %d/%d passed" "$PASS" "$TOTAL"
+if [ "$FAIL" -gt 0 ]; then
+  printf ", %d FAILED" "$FAIL"
+fi
+echo
+echo "═══════════════════════════════════════════════════════"
+
+[ "$FAIL" -eq 0 ] || exit 1
+`}).
+		Stdout(ctx)
+}
+
+// ═══════════════════════════════════════════════════════════
 // Self-hosting bootstrap: staged package builds
 // ═══════════════════════════════════════════════════════════
 
