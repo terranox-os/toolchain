@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# TerranoxOS Stage 0 — cross-compiler built with Alpine's seed Clang.
+#
+# This is the first stage of the 3-stage bootstrap. It produces a Clang
+# that targets x86_64-linux-musl, built using Alpine's system Clang as
+# the seed compiler.
+#
+# Build:
+#   dagger call melange-build --source=. --package-name=terranox-stage0
+#
+# The output is a build-time dependency only — not installed on end systems.
+
+package:
+  name: terranox-stage0
+  version: 21.1.8
+  epoch: 0
+  description: "TerranoxOS Stage 0 cross-compiler (build dependency)"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/main
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/community
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - linux-headers
+      - clang
+      - lld
+      - llvm
+      - compiler-rt
+      - cmake
+      - ninja
+      - samurai
+      - python3
+      - bash
+      - file
+      - wget
+      - xz
+      - tar
+      - sed
+
+pipeline:
+  - runs: |
+      set -e
+
+      LLVM_VERSION="21.1.8"
+      TARGET="x86_64-linux-musl"
+      NJOBS=$(nproc)
+      echo "==> Building Stage 0 cross-compiler (${NJOBS} jobs)"
+
+      # ── Fetch LLVM source ──────────────────────────────────
+      echo "==> Fetching LLVM ${LLVM_VERSION}"
+      wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+        -O /tmp/llvm.tar.xz
+      tar xf /tmp/llvm.tar.xz -C /tmp/
+      LLVM_SRC="/tmp/llvm-project-${LLVM_VERSION}.src"
+
+      # ── Apply Terranox patches ─────────────────────────────
+      echo "==> Applying Terranox triple patches"
+      cd "${LLVM_SRC}"
+
+      sed -i '/Serenity,/a\    Terranox,   \/\/ TerranoxOS' \
+        llvm/include/llvm/TargetParser/Triple.h
+
+      sed -i '/case Serenity: return "serenity";/a\  case Terranox: return "terranox";' \
+        llvm/lib/TargetParser/Triple.cpp
+
+      sed -i '/.StartsWith("serenity", Triple::Serenity)/a\    .StartsWith("terranox", Triple::Terranox)' \
+        llvm/lib/TargetParser/Triple.cpp
+
+      sed -i '/case llvm::Triple::Hurd:/i\    case llvm::Triple::Terranox:\n      return std::make_unique<TerranoxOSTargetInfo<X86_64TargetInfo>>(Triple, Opts);' \
+        clang/lib/Basic/Targets.cpp
+
+      sed -i '/^} \/\/ namespace targets/i\
+      \n\/\/ TerranoxOS Target\ntemplate <typename Target>\nclass LLVM_LIBRARY_VISIBILITY TerranoxOSTargetInfo : public OSTargetInfo<Target> {\nprotected:\n  void getOSDefines(const LangOptions \&Opts, const llvm::Triple \&Triple,\n                    MacroBuilder \&Builder) const override {\n    Builder.defineMacro("__terranox__");\n    Builder.defineMacro("__ELF__");\n    if (Opts.POSIXThreads)\n      Builder.defineMacro("_REENTRANT");\n    if (Opts.CPlusPlus)\n      Builder.defineMacro("_GNU_SOURCE");\n  }\n\npublic:\n  TerranoxOSTargetInfo(const llvm::Triple \&Triple, const TargetOptions \&Opts)\n      : OSTargetInfo<Target>(Triple, Opts) {\n    this->WIntType = TargetInfo::UnsignedInt;\n  }\n};\n' \
+        clang/lib/Basic/Targets/OSTargets.h
+
+      echo "==> Patches applied"
+      grep -c "Terranox" llvm/include/llvm/TargetParser/Triple.h
+      grep -c "Terranox" llvm/lib/TargetParser/Triple.cpp
+      grep -c "TerranoxOS" clang/lib/Basic/Targets/OSTargets.h
+
+      # ── Build Stage 0 ──────────────────────────────────────
+      mkdir -p /tmp/build-stage0
+      cd /tmp/build-stage0
+      cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DLLVM_ENABLE_PROJECTS="clang;lld" \
+        -DLLVM_ENABLE_RUNTIMES= \
+        -DLLVM_TARGETS_TO_BUILD=X86 \
+        -DLLVM_DEFAULT_TARGET_TRIPLE="${TARGET}" \
+        -DCLANG_DEFAULT_LINKER=lld \
+        -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+        -DCLANG_DEFAULT_RTLIB=compiler-rt \
+        -DCLANG_DEFAULT_UNWINDLIB=libunwind \
+        -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_DOCS=OFF \
+        -DLLVM_PARALLEL_LINK_JOBS=2 \
+        "${LLVM_SRC}/llvm"
+      ninja -j${NJOBS}
+      DESTDIR="${{targets.destdir}}" ninja install
+
+      echo "==> Stage 0 complete"
+      ${{targets.destdir}}/usr/bin/clang --version

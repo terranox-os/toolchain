@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# TerranoxOS Sysroot — musl libc + LLVM runtimes.
+#
+# This is the second stage of the 3-stage bootstrap. It builds:
+#   - Linux kernel headers
+#   - musl libc (headers + full build)
+#   - LLVM runtimes (compiler-rt, libunwind, libc++abi, libc++)
+#
+# The sysroot is built using Alpine's seed Clang (not Stage 0) since
+# both the host and target are musl — no cross-compilation needed.
+#
+# Build (requires terranox-stage0 in local repo for future use):
+#   dagger call melange-build --source=. --package-name=terranox-sysroot
+#
+# The output is used by Stage 1 to link the self-hosted compiler.
+
+package:
+  name: terranox-sysroot
+  version: 21.1.8
+  epoch: 0
+  description: "TerranoxOS musl sysroot (kernel headers, musl libc, LLVM runtimes)"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+  dependencies:
+    runtime:
+      - musl
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/main
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/community
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - linux-headers
+      - clang
+      - lld
+      - llvm
+      - compiler-rt
+      - cmake
+      - ninja
+      - samurai
+      - make
+      - python3
+      - bash
+      - coreutils
+      - file
+      - wget
+      - xz
+      - tar
+      - perl
+      - rsync
+      - gcc
+      - sed
+
+pipeline:
+  - runs: |
+      set -e
+
+      LLVM_VERSION="21.1.8"
+      MUSL_VERSION="1.2.5"
+      LINUX_VERSION="6.12.8"
+      TARGET="x86_64-linux-musl"
+      ARCH="x86_64"
+      NJOBS=$(nproc)
+      echo "==> Building sysroot (${NJOBS} jobs)"
+
+      # ── Fetch sources ──────────────────────────────────────
+      echo "==> Fetching LLVM ${LLVM_VERSION}"
+      wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+        -O /tmp/llvm.tar.xz
+      tar xf /tmp/llvm.tar.xz -C /tmp/
+      LLVM_SRC="/tmp/llvm-project-${LLVM_VERSION}.src"
+
+      echo "==> Fetching musl ${MUSL_VERSION}"
+      wget -q "https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz" \
+        -O /tmp/musl.tar.gz
+      tar xzf /tmp/musl.tar.gz -C /tmp/
+
+      echo "==> Fetching Linux ${LINUX_VERSION} headers"
+      LINUX_MAJOR=$(echo "${LINUX_VERSION}" | cut -d. -f1)
+      wget -q "https://cdn.kernel.org/pub/linux/kernel/v${LINUX_MAJOR}.x/linux-${LINUX_VERSION}.tar.xz" \
+        -O /tmp/linux.tar.xz
+      tar xf /tmp/linux.tar.xz -C /tmp/
+
+      # ── Linux kernel headers ───────────────────────────────
+      echo "==> Installing kernel headers"
+      SYSROOT="${{targets.destdir}}/usr/share/terranox-sysroot"
+      mkdir -p "${SYSROOT}/usr/lib" "${SYSROOT}/usr/include" "${SYSROOT}/lib"
+
+      cd "/tmp/linux-${LINUX_VERSION}"
+      make mrproper
+      make ARCH="${ARCH}" INSTALL_HDR_PATH="${SYSROOT}/usr" headers_install
+
+      # ── musl libc ──────────────────────────────────────────
+      echo "==> Building musl"
+      cd "/tmp/musl-${MUSL_VERSION}"
+      make ARCH="${ARCH}" prefix=/usr DESTDIR="${SYSROOT}" install-headers
+
+      CC="clang --target=${TARGET} -fuse-ld=lld --rtlib=compiler-rt" AR=llvm-ar RANLIB=llvm-ranlib \
+        ./configure --prefix=/usr --target="${TARGET}" --disable-wrapper
+      make -j${NJOBS}
+      make DESTDIR="${SYSROOT}" install
+
+      # Dynamic linker symlink
+      ln -sf /usr/lib/libc.so "${SYSROOT}/lib/ld-musl-x86_64.so.1"
+
+      # ── LLVM runtimes ──────────────────────────────────────
+      echo "==> Building LLVM runtimes against sysroot"
+      mkdir -p /tmp/build-runtimes
+      cd /tmp/build-runtimes
+      cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${SYSROOT}/usr" \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_C_COMPILER_TARGET="${TARGET}" \
+        -DCMAKE_CXX_COMPILER_TARGET="${TARGET}" \
+        -DCMAKE_ASM_COMPILER_TARGET="${TARGET}" \
+        -DCMAKE_SYSROOT="${SYSROOT}" \
+        -DCMAKE_C_FLAGS=-fPIC \
+        -DCMAKE_CXX_FLAGS=-fPIC \
+        -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+        -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld \
+        -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+        -DLLVM_ENABLE_RUNTIMES="compiler-rt;libunwind;libcxxabi;libcxx" \
+        -DCOMPILER_RT_BUILD_BUILTINS=ON \
+        -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+        -DCOMPILER_RT_BUILD_XRAY=OFF \
+        -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+        -DCOMPILER_RT_BUILD_PROFILE=OFF \
+        -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+        -DCOMPILER_RT_BUILD_ORC=OFF \
+        -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+        -DLIBUNWIND_USE_COMPILER_RT=ON \
+        -DLIBUNWIND_ENABLE_STATIC=ON \
+        -DLIBUNWIND_ENABLE_SHARED=OFF \
+        -DLIBCXXABI_USE_COMPILER_RT=ON \
+        -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+        -DLIBCXXABI_ENABLE_STATIC=ON \
+        -DLIBCXXABI_ENABLE_SHARED=OFF \
+        -DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF \
+        -DLIBCXX_USE_COMPILER_RT=ON \
+        -DLIBCXX_HAS_MUSL_LIBC=ON \
+        -DLIBCXX_ENABLE_STATIC=ON \
+        -DLIBCXX_ENABLE_SHARED=OFF \
+        -DLIBCXX_CXX_ABI=libcxxabi \
+        "${LLVM_SRC}/runtimes"
+      ninja -j${NJOBS}
+      ninja install
+
+      # libgcc compatibility shim
+      echo 'INPUT(-lclang_rt.builtins -lunwind)' > "${SYSROOT}/usr/lib/libgcc_s.so"
+
+      # libc++ linker script — wraps libc++.a to automatically pull in libc++abi.
+      # Without this, clang++ -stdlib=libc++ links -lc++ but not -lc++abi,
+      # causing undefined __cxa_* symbols.
+      mv "${SYSROOT}/usr/lib/libc++.a" "${SYSROOT}/usr/lib/libc++_real.a"
+      echo 'INPUT(libc++_real.a libc++abi.a)' > "${SYSROOT}/usr/lib/libc++.a"
+
+      # Also install runtime libs to /usr/lib for packages that link directly
+      mkdir -p "${{targets.destdir}}/usr/lib"
+      cp "${SYSROOT}/usr/lib/libc++*.a" "${{targets.destdir}}/usr/lib/" 2>/dev/null || true
+      cp "${SYSROOT}/usr/lib/libunwind*.a" "${{targets.destdir}}/usr/lib/" 2>/dev/null || true
+      cp "${SYSROOT}/usr/lib/libgcc_s.so" "${{targets.destdir}}/usr/lib/" 2>/dev/null || true
+
+      echo "==> Sysroot complete"
+      echo "Contents:"
+      ls "${SYSROOT}/usr/lib/"*.a 2>/dev/null | head -10
+      ls "${SYSROOT}/usr/lib/linux/" 2>/dev/null | head -10

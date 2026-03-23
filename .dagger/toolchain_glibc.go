@@ -100,7 +100,7 @@ func (m *TerranoxBootstrap) GlibcStage0(
 			"-DLLVM_INCLUDE_DOCS=OFF",
 			"-DLLVM_PARALLEL_LINK_JOBS=2",
 			"/tmp/llvm-project/llvm"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		Directory("/opt/terranox-glibc/cross-tools")
 }
@@ -261,7 +261,7 @@ func (m *TerranoxBootstrap) GlibcSysroot(
 			"-DLIBCXX_ENABLE_SHARED=OFF",
 			"-DLIBCXX_CXX_ABI=libcxxabi",
 			"/tmp/llvm-project/runtimes"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		// Create libgcc compatibility shim
 		WithExec([]string{"sh", "-c",
@@ -399,7 +399,7 @@ func (m *TerranoxBootstrap) GlibcStage1(
 			"-DLLVM_INCLUDE_BENCHMARKS=OFF",
 			"-DLLVM_PARALLEL_LINK_JOBS=2",
 			"/tmp/llvm-project/llvm"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		Directory("/opt/terranox-glibc/tools")
 }

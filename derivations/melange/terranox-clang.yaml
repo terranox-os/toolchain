@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# TerranoxOS Clang — Stage 1 self-hosted compiler.
+#
+# This is the final stage of the 3-stage bootstrap. It builds a self-hosted
+# Clang using the Stage 0 cross-compiler and linking against the musl sysroot.
+# The result is a pure LLVM/Clang toolchain with zero GNU dependencies.
+#
+# Requires terranox-stage0 and terranox-sysroot in the local package repo.
+#
+# Build:
+#   dagger call build-toolchain-image --source=.
+#
+# Or manually (stage0 + sysroot must be built first):
+#   dagger call melange-build --source=. --package-name=terranox-clang \
+#     --local-repo=./out/stage0+sysroot
+
+package:
+  name: terranox-clang
+  version: 21.1.8
+  epoch: 0
+  description: "TerranoxOS LLVM/Clang self-hosted musl toolchain"
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64
+  dependencies:
+    runtime:
+      - musl
+      - terranox-sysroot
+
+environment:
+  contents:
+    keyring:
+      - https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+    repositories:
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/main
+      - https://dl-cdn.alpinelinux.org/alpine/v3.21/community
+    packages:
+      - alpine-baselayout-data
+      - busybox
+      - ca-certificates-bundle
+      - musl
+      - musl-dev
+      - linux-headers
+      - cmake
+      - ninja
+      - samurai
+      - python3
+      - bash
+      - file
+      - wget
+      - xz
+      - tar
+      - sed
+      # Stage 0 and sysroot come from the local repo
+      - terranox-stage0
+      - terranox-sysroot
+
+pipeline:
+  - runs: |
+      set -e
+
+      LLVM_VERSION="21.1.8"
+      TARGET="x86_64-linux-musl"
+      NJOBS=$(nproc)
+      echo "==> Building Stage 1 self-hosted compiler (${NJOBS} jobs)"
+
+      # Verify Stage 0 and Sysroot are available from the local repo
+      echo "==> Checking Stage 0 compiler"
+      /usr/bin/clang --version
+      echo "==> Checking sysroot"
+      ls /usr/share/terranox-sysroot/usr/lib/libc.a
+      ls /usr/share/terranox-sysroot/usr/include/stdio.h
+
+      STAGE0="/usr"
+      SYSROOT="/usr/share/terranox-sysroot"
+
+      # ── Fetch LLVM source ──────────────────────────────────
+      echo "==> Fetching LLVM ${LLVM_VERSION}"
+      wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+        -O /tmp/llvm.tar.xz
+      tar xf /tmp/llvm.tar.xz -C /tmp/
+      LLVM_SRC="/tmp/llvm-project-${LLVM_VERSION}.src"
+
+      # ── Apply Terranox patches ─────────────────────────────
+      echo "==> Applying Terranox triple patches"
+      cd "${LLVM_SRC}"
+
+      sed -i '/Serenity,/a\    Terranox,   \/\/ TerranoxOS' \
+        llvm/include/llvm/TargetParser/Triple.h
+
+      sed -i '/case Serenity: return "serenity";/a\  case Terranox: return "terranox";' \
+        llvm/lib/TargetParser/Triple.cpp
+
+      sed -i '/.StartsWith("serenity", Triple::Serenity)/a\    .StartsWith("terranox", Triple::Terranox)' \
+        llvm/lib/TargetParser/Triple.cpp
+
+      sed -i '/case llvm::Triple::Hurd:/i\    case llvm::Triple::Terranox:\n      return std::make_unique<TerranoxOSTargetInfo<X86_64TargetInfo>>(Triple, Opts);' \
+        clang/lib/Basic/Targets.cpp
+
+      sed -i '/^} \/\/ namespace targets/i\
+      \n\/\/ TerranoxOS Target\ntemplate <typename Target>\nclass LLVM_LIBRARY_VISIBILITY TerranoxOSTargetInfo : public OSTargetInfo<Target> {\nprotected:\n  void getOSDefines(const LangOptions \&Opts, const llvm::Triple \&Triple,\n                    MacroBuilder \&Builder) const override {\n    Builder.defineMacro("__terranox__");\n    Builder.defineMacro("__ELF__");\n    if (Opts.POSIXThreads)\n      Builder.defineMacro("_REENTRANT");\n    if (Opts.CPlusPlus)\n      Builder.defineMacro("_GNU_SOURCE");\n  }\n\npublic:\n  TerranoxOSTargetInfo(const llvm::Triple \&Triple, const TargetOptions \&Opts)\n      : OSTargetInfo<Target>(Triple, Opts) {\n    this->WIntType = TargetInfo::UnsignedInt;\n  }\n};\n' \
+        clang/lib/Basic/Targets/OSTargets.h
+
+      echo "==> Patches applied"
+
+      # ── Copy runtime libraries to Stage 0's resource directory ──
+      echo "==> Setting up Stage 0 resource directory"
+      CLANG_MAJOR=$(echo "${LLVM_VERSION}" | cut -d. -f1)
+      RT_DIR="${STAGE0}/lib/clang/${CLANG_MAJOR}/lib/x86_64-unknown-linux-musl"
+      mkdir -p "${RT_DIR}"
+      cp -a "${SYSROOT}/usr/lib/linux/"* "${RT_DIR}/" 2>/dev/null || true
+      cp "${SYSROOT}/usr/lib/crt"*.o "${RT_DIR}/" 2>/dev/null || true
+      cd "${RT_DIR}"
+      ln -sf libclang_rt.builtins-x86_64.a libclang_rt.builtins.a 2>/dev/null || true
+      ln -sf clang_rt.crtbegin-x86_64.o crtbeginS.o 2>/dev/null || true
+      ln -sf clang_rt.crtbegin-x86_64.o crtbegin.o 2>/dev/null || true
+      ln -sf clang_rt.crtend-x86_64.o crtendS.o 2>/dev/null || true
+      ln -sf clang_rt.crtend-x86_64.o crtend.o 2>/dev/null || true
+
+      # ── Build Stage 1 ─────────────────────────────────────
+      export PATH="${STAGE0}/bin:${PATH}"
+
+      mkdir -p /tmp/build-stage1
+      cd /tmp/build-stage1
+      cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_COMPILER="${STAGE0}/bin/clang" \
+        -DCMAKE_CXX_COMPILER="${STAGE0}/bin/clang++" \
+        -DCMAKE_C_FLAGS="--sysroot=${SYSROOT}" \
+        -DCMAKE_CXX_FLAGS="--sysroot=${SYSROOT} -stdlib=libc++" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -L${SYSROOT}/usr/lib -lc++abi -lunwind" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -L${SYSROOT}/usr/lib -lc++abi -lunwind" \
+        -DCMAKE_CROSSCOMPILING=FALSE \
+        -DLLVM_ENABLE_PROJECTS="clang;lld" \
+        -DLLVM_ENABLE_RUNTIMES= \
+        -DLLVM_TARGETS_TO_BUILD=X86 \
+        -DLLVM_DEFAULT_TARGET_TRIPLE="${TARGET}" \
+        -DLLVM_HOST_TRIPLE="${TARGET}" \
+        -DCLANG_DEFAULT_LINKER=lld \
+        -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+        -DCLANG_DEFAULT_RTLIB=compiler-rt \
+        -DCLANG_DEFAULT_UNWINDLIB=libunwind \
+        -DDEFAULT_SYSROOT=/usr/share/terranox-sysroot \
+        -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_PARALLEL_LINK_JOBS=2 \
+        "${LLVM_SRC}/llvm"
+      ninja -j${NJOBS}
+      DESTDIR="${{targets.destdir}}" ninja install
+
+      # ── Install clang resource directory ────────────────────
+      echo "==> Installing runtime libraries"
+      DEST_RT="${{targets.destdir}}/usr/lib/clang/${CLANG_MAJOR}/lib/x86_64-unknown-linux-musl"
+      mkdir -p "${DEST_RT}"
+      cp -a "${SYSROOT}/usr/lib/linux/"* "${DEST_RT}/" 2>/dev/null || true
+      cp "${SYSROOT}/usr/lib/crt"*.o "${DEST_RT}/" 2>/dev/null || true
+      cd "${DEST_RT}"
+      ln -sf libclang_rt.builtins-x86_64.a libclang_rt.builtins.a 2>/dev/null || true
+      ln -sf clang_rt.crtbegin-x86_64.o crtbeginS.o 2>/dev/null || true
+      ln -sf clang_rt.crtbegin-x86_64.o crtbegin.o 2>/dev/null || true
+      ln -sf clang_rt.crtend-x86_64.o crtendS.o 2>/dev/null || true
+      ln -sf clang_rt.crtend-x86_64.o crtend.o 2>/dev/null || true
+
+      # Clang configuration files — automatically link libc++abi and libunwind.
+      # Clang searches <InstalledDir>/../etc/clang/ — for /usr/bin that's /usr/etc/clang/
+      mkdir -p "${{targets.destdir}}/usr/etc/clang"
+      echo "-lc++abi -lunwind" > "${{targets.destdir}}/usr/etc/clang/x86_64-unknown-linux-musl-clang++.cfg"
+      echo "-lunwind" > "${{targets.destdir}}/usr/etc/clang/x86_64-unknown-linux-musl-clang.cfg"
+
+      # Convenience symlinks
+      cd "${{targets.destdir}}/usr/bin"
+      ln -sf clang cc
+      ln -sf clang++ c++
+      ln -sf lld ld
+      ln -sf llvm-ar ar
+      ln -sf llvm-ranlib ranlib
+      ln -sf llvm-nm nm
+      ln -sf llvm-objdump objdump
+      ln -sf llvm-strip strip
+
+      echo "==> Stage 1 complete"
+      ${{targets.destdir}}/usr/bin/clang --version

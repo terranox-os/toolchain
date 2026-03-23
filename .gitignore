@@ -14,3 +14,9 @@
 *.rsa
 *.rsa.pub
 build/
+
+# Dagger CLI
+/bin/
+
+# Build artifacts
+*.tar

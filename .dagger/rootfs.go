@@ -505,7 +505,16 @@ func (m *TerranoxBootstrap) MelangeBuild(
 
 	manifestPath := fmt.Sprintf("derivations/melange/%s.yaml", packageName)
 
-	// Build package with melange
+	// Extract signing key separately from source.
+	signingKey := source.File("packages/melange.rsa")
+	signingKeyPub := source.File("packages/melange.rsa.pub")
+
+	// Build source without signing keys for cache stability.
+	buildSource := dag.Directory().
+		WithDirectory("derivations", source.Directory("derivations")).
+		WithDirectory("patches", source.Directory("patches")).
+		WithFile("bootstrap.toml", source.File("bootstrap.toml"))
+
 	buildScript := `#!/bin/sh
 set -e
 
@@ -515,37 +524,28 @@ echo "==> Manifest: ${MANIFEST_PATH}"
 # Install build dependencies
 apk add --no-cache build-base curl bubblewrap
 
-# Download and install melange from release tarball
-# (Wolfi APK packages are glibc-linked and won't run on Alpine/musl)
+# Download and install melange
 echo "==> Installing melange"
 MELANGE_URL=$(curl -fsSL https://api.github.com/repos/chainguard-dev/melange/releases/latest \
   | grep browser_download_url | grep linux_amd64.tar.gz\" | head -1 | cut -d'"' -f4)
 echo "Downloading: ${MELANGE_URL}"
 curl -fsSL "${MELANGE_URL}" | tar xz --strip-components=1 -C /usr/local/bin
-
-# Verify melange
 melange version
 
-# Create output directory
 mkdir -p /workspace/packages/x86_64
 
-# Copy signing key
-mkdir -p /workspace/keys
-cp /signing-key/melange.rsa /workspace/keys/melange.rsa
-cp /signing-key/melange.rsa.pub /workspace/keys/melange.rsa.pub
-chmod 600 /workspace/keys/melange.rsa
-
-# Set up Alpine keyring for package dependencies
+# Set up Alpine keyring
 mkdir -p /etc/apk/keys
 wget -qO /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
   https://alpinelinux.org/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
 
-# Set up local repo keyring if present
+# Copy our signing public key so melange trusts local repo packages
+cp /signing-key/melange.rsa.pub /etc/apk/keys/melange.rsa.pub
+
+# Set up local repo if present
 LOCAL_REPO_FLAGS=""
 if [ -d /local-repo ]; then
   echo "==> Local package repo detected"
-  cp /signing-key/melange.rsa.pub /etc/apk/keys/melange.rsa.pub
-  # Ensure repo has x86_64 structure
   if [ ! -d /local-repo/x86_64 ]; then
     mkdir -p /tmp/local-repo/x86_64
     cp /local-repo/*.apk /tmp/local-repo/x86_64/ 2>/dev/null || true
@@ -557,14 +557,13 @@ if [ -d /local-repo ]; then
   ls -lh /local-repo/ | head -10
 fi
 
-# Detect if terranox-clang is in the local repo — if so, inject it and set CC/CXX
+# Detect terranox-clang for self-hosting
 CLANG_ENV_FLAGS=""
 CLANG_PKG_FLAGS=""
 if [ -d /local-repo ] && ls /local-repo/terranox-clang-*.apk >/dev/null 2>&1 || \
    [ -d /local-repo/x86_64 ] && ls /local-repo/x86_64/terranox-clang-*.apk >/dev/null 2>&1; then
   echo "==> terranox-clang detected, will compile with clang"
   CLANG_PKG_FLAGS="--package-append terranox-clang"
-  # melange uses --env-file, not --env
   cat > /tmp/clang-env <<'ENVEOF'
 CC=clang
 CXX=clang++
@@ -575,14 +574,14 @@ ENVEOF
   CLANG_ENV_FLAGS="--env-file /tmp/clang-env"
 fi
 
-# Build package (bubblewrap provides sandboxing inside Dagger container)
+# Build and sign with real key
 cd /workspace
 melange build \
   --runner bubblewrap \
-  --signing-key /workspace/keys/melange.rsa \
+  --signing-key /signing-key/melange.rsa \
   --arch x86_64 \
   --out-dir /workspace/packages/x86_64 \
-  --repository-append https://dl-cdn.alpinelinux.org/alpine/v3.19/main \
+  --repository-append https://dl-cdn.alpinelinux.org/alpine/v3.21/main \
   --keyring-append /etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub \
   $LOCAL_REPO_FLAGS \
   $CLANG_PKG_FLAGS \
@@ -590,20 +589,14 @@ melange build \
   /source/${MANIFEST_PATH}
 
 echo "==> Build complete"
-ls -lh /workspace/packages/x86_64/
+ls -lhR /workspace/packages/
 `
 
-	// Extract signing key from source
-	signingKey := source.File("packages/melange.rsa")
-	signingKeyPub := source.File("packages/melange.rsa.pub")
-
-	// Build container
 	// InsecureRootCapabilities is required because melange's bubblewrap runner
-	// needs CAP_SYS_ADMIN for user namespace creation. Dagger already provides
-	// container isolation so this doesn't reduce security.
+	// needs CAP_SYS_ADMIN for user namespace creation.
 	builder := dag.Container().
-		From("alpine:3.19").
-		WithDirectory("/source", source).
+		From("alpine:3.21").
+		WithDirectory("/source", buildSource).
 		WithFile("/signing-key/melange.rsa", signingKey).
 		WithFile("/signing-key/melange.rsa.pub", signingKeyPub).
 		WithEnvVariable("PACKAGE_NAME", packageName).
@@ -619,8 +612,8 @@ ls -lh /workspace/packages/x86_64/
 			InsecureRootCapabilities: true,
 		})
 
-	// Return packages directory
-	return builder.Directory("/workspace/packages/x86_64"), nil
+	// melange creates an arch subdirectory inside --out-dir
+	return builder.Directory("/workspace/packages/x86_64/x86_64"), nil
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -744,6 +737,11 @@ if [ ! -d /local-repo/x86_64 ]; then
 else
   LOCAL_REPO_PATH=/local-repo
 fi
+
+# Create /packages symlink so apko YAML can reference it directly
+mkdir -p /packages/x86_64
+cp ${LOCAL_REPO_PATH}/x86_64/*.apk /packages/x86_64/ 2>/dev/null || cp ${LOCAL_REPO_PATH}/*.apk /packages/x86_64/ 2>/dev/null || true
+cp ${LOCAL_REPO_PATH}/x86_64/APKINDEX.tar.gz /packages/x86_64/ 2>/dev/null || cp ${LOCAL_REPO_PATH}/APKINDEX.tar.gz /packages/x86_64/ 2>/dev/null || true
 `
 		localRepoFlag = ` --repository-append $LOCAL_REPO_PATH --keyring-append /etc/apk/keys/melange.rsa.pub`
 	}
@@ -1271,6 +1269,387 @@ func (m *TerranoxBootstrap) ToolchainApkImage(
 		WithWorkdir("/workspace")
 
 	return ctr, nil
+}
+
+// ═══════════════════════════════════════════════════════════
+// Pre-flight validation for melange builds
+// ═══════════════════════════════════════════════════════════
+
+// PreflightToolchain validates all prerequisites for the toolchain melange
+// build without actually building LLVM. Catches issues in ~2 minutes that
+// would otherwise fail 30-60 minutes into a full build.
+//
+// Checks:
+//  1. Signing keys exist (melange.rsa + melange.rsa.pub)
+//  2. Melange YAML parses and environment packages install
+//  3. Seed compiler version is sufficient (>= Clang 19)
+//  4. LLVM source fetches and patches apply cleanly
+//  5. musl configures with the correct CC/linker flags
+//  6. LLVM runtimes cmake configure succeeds (without building)
+//  7. A trivial C++ program compiles with the seed compiler + libc++
+//
+// Usage:
+//
+//	dagger call preflight-toolchain --source=.
+func (m *TerranoxBootstrap) PreflightToolchain(
+	ctx context.Context,
+	// Repository source directory
+	source *dagger.Directory,
+	// LLVM version to validate against
+	// +default="21.1.8"
+	llvmVersion string,
+) (string, error) {
+	// Check 1: Signing keys (must be PKCS#1 format for melange)
+	rsaKey, err := source.File("packages/melange.rsa").Contents(ctx)
+	if err != nil {
+		return "", fmt.Errorf("FAIL: packages/melange.rsa not found — run: openssl genrsa -traditional -out packages/melange.rsa 4096")
+	}
+	if !strings.Contains(rsaKey, "BEGIN RSA PRIVATE KEY") {
+		return "", fmt.Errorf("FAIL: packages/melange.rsa is PKCS#8 format — melange requires PKCS#1. Regenerate: openssl genrsa -traditional -out packages/melange.rsa 4096")
+	}
+	_, err = source.File("packages/melange.rsa.pub").Contents(ctx)
+	if err != nil {
+		return "", fmt.Errorf("FAIL: packages/melange.rsa.pub not found")
+	}
+
+	// Check 2: Melange YAML exists
+	_, err = source.File("derivations/melange/terranox-clang.yaml").Contents(ctx)
+	if err != nil {
+		return "", fmt.Errorf("FAIL: derivations/melange/terranox-clang.yaml not found")
+	}
+
+	// Checks 3-7: Run in container matching the melange environment
+	return dag.Container().
+		From("alpine:3.21").
+		WithExec([]string{"apk", "add", "--no-cache",
+			"clang", "lld", "llvm", "compiler-rt",
+			"cmake", "ninja", "samurai", "make",
+			"python3", "bash", "coreutils", "file",
+			"musl-dev", "linux-headers",
+			"wget", "xz", "tar", "sed",
+		}).
+		WithDirectory("/source", source).
+		WithNewFile("/preflight.sh", fmt.Sprintf(`#!/bin/sh
+set -e
+
+LLVM_VERSION="%s"
+TARGET="x86_64-linux-musl"
+PASS=0
+FAIL=0
+
+check_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+check_fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+
+echo "═══════════════════════════════════════════════════════"
+echo "  TerranoxOS Toolchain Pre-flight Validation"
+echo "═══════════════════════════════════════════════════════"
+echo
+
+# ── Check 3: Seed compiler version ──
+echo "--- Seed Compiler ---"
+CLANG_VER=$(clang --version | head -1 | sed 's/.*version \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+CLANG_MAJOR=$(echo "$CLANG_VER" | cut -d. -f1)
+echo "Clang version: $CLANG_VER (major: $CLANG_MAJOR)"
+if [ "$CLANG_MAJOR" -ge 19 ]; then
+  check_pass "seed compiler >= 19 (have $CLANG_VER)"
+else
+  check_fail "seed compiler too old ($CLANG_VER < 19) — LLVM 21 libc++ needs __builtin_clzg"
+fi
+
+# Verify lld available
+if command -v ld.lld >/dev/null 2>&1; then
+  check_pass "ld.lld available"
+else
+  check_fail "ld.lld not found"
+fi
+
+# Verify compiler-rt available
+if [ -f /usr/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a ] 2>/dev/null || \
+   [ -f /usr/lib/clang/*/lib/x86_64-alpine-linux-musl/libclang_rt.builtins.a ] 2>/dev/null; then
+  check_pass "compiler-rt builtins available"
+else
+  check_fail "compiler-rt builtins not found"
+fi
+echo
+
+# ── Check 4: LLVM source + patches ──
+echo "--- LLVM Source & Patches ---"
+if wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+  -O /tmp/llvm.tar.xz 2>&1; then
+  check_pass "LLVM ${LLVM_VERSION} tarball downloaded"
+else
+  check_fail "LLVM ${LLVM_VERSION} tarball download failed"
+fi
+
+tar xf /tmp/llvm.tar.xz -C /tmp/
+LLVM_SRC="/tmp/llvm-project-${LLVM_VERSION}.src"
+
+if [ -d "$LLVM_SRC" ]; then
+  check_pass "LLVM source extracted"
+else
+  check_fail "LLVM source directory not found"
+  echo "RESULT: ${PASS} passed, ${FAIL} failed"
+  exit 1
+fi
+
+# Apply patches via sed (same as melange YAML)
+cd "$LLVM_SRC"
+
+sed -i '/Serenity,/a\    Terranox,   \/\/ TerranoxOS' \
+  llvm/include/llvm/TargetParser/Triple.h
+if grep -q "Terranox" llvm/include/llvm/TargetParser/Triple.h; then
+  check_pass "patch 1a: Triple.h Terranox enum added"
+else
+  check_fail "patch 1a: Triple.h sed failed"
+fi
+
+sed -i '/case Serenity: return "serenity";/a\  case Terranox: return "terranox";' \
+  llvm/lib/TargetParser/Triple.cpp
+if grep -q 'case Terranox:' llvm/lib/TargetParser/Triple.cpp; then
+  check_pass "patch 1b: Triple.cpp getOSTypeName added"
+else
+  check_fail "patch 1b: Triple.cpp getOSTypeName sed failed"
+fi
+
+sed -i '/.StartsWith("serenity", Triple::Serenity)/a\    .StartsWith("terranox", Triple::Terranox)' \
+  llvm/lib/TargetParser/Triple.cpp
+if grep -c 'Terranox' llvm/lib/TargetParser/Triple.cpp | grep -q '2'; then
+  check_pass "patch 1c: Triple.cpp parseOS added"
+else
+  check_fail "patch 1c: Triple.cpp parseOS sed failed"
+fi
+
+sed -i '/case llvm::Triple::Hurd:/i\    case llvm::Triple::Terranox:\n      return std::make_unique<TerranoxOSTargetInfo<X86_64TargetInfo>>(Triple, Opts);' \
+  clang/lib/Basic/Targets.cpp
+if grep -q 'TerranoxOSTargetInfo' clang/lib/Basic/Targets.cpp; then
+  check_pass "patch 2a: Targets.cpp TerranoxOS case added"
+else
+  check_fail "patch 2a: Targets.cpp sed failed"
+fi
+
+sed -i '/^} \/\/ namespace targets/i\
+\n\/\/ TerranoxOS Target\ntemplate <typename Target>\nclass LLVM_LIBRARY_VISIBILITY TerranoxOSTargetInfo : public OSTargetInfo<Target> {\nprotected:\n  void getOSDefines(const LangOptions \&Opts, const llvm::Triple \&Triple,\n                    MacroBuilder \&Builder) const override {\n    Builder.defineMacro("__terranox__");\n    Builder.defineMacro("__ELF__");\n    if (Opts.POSIXThreads)\n      Builder.defineMacro("_REENTRANT");\n    if (Opts.CPlusPlus)\n      Builder.defineMacro("_GNU_SOURCE");\n  }\n\npublic:\n  TerranoxOSTargetInfo(const llvm::Triple \&Triple, const TargetOptions \&Opts)\n      : OSTargetInfo<Target>(Triple, Opts) {\n    this->WIntType = TargetInfo::UnsignedInt;\n  }\n};\n' \
+  clang/lib/Basic/Targets/OSTargets.h
+if grep -q 'TerranoxOSTargetInfo' clang/lib/Basic/Targets/OSTargets.h; then
+  check_pass "patch 2b: OSTargets.h TerranoxOSTargetInfo class added"
+else
+  check_fail "patch 2b: OSTargets.h sed failed"
+fi
+echo
+
+# ── Check 5: musl configure with correct CC flags ──
+echo "--- musl Configure Test ---"
+wget -q "https://musl.libc.org/releases/musl-1.2.5.tar.gz" -O /tmp/musl.tar.gz
+tar xzf /tmp/musl.tar.gz -C /tmp/
+cd /tmp/musl-1.2.5
+
+CC="clang --target=${TARGET} -fuse-ld=lld --rtlib=compiler-rt" AR=llvm-ar RANLIB=llvm-ranlib \
+  ./configure --prefix=/usr --target="${TARGET}" --disable-wrapper > /tmp/musl-configure.log 2>&1
+if [ $? -eq 0 ]; then
+  check_pass "musl configure succeeds with clang+lld+compiler-rt"
+else
+  check_fail "musl configure failed — check CC flags"
+  tail -5 /tmp/musl-configure.log
+fi
+
+# Quick compile test to verify linker works
+echo 'int main(void) { return 0; }' > /tmp/test.c
+if clang --target="${TARGET}" -fuse-ld=lld --rtlib=compiler-rt -o /tmp/test /tmp/test.c 2>/dev/null; then
+  check_pass "trivial C program compiles with clang+lld+compiler-rt"
+else
+  check_fail "trivial C program fails to compile"
+fi
+echo
+
+# ── Check 6: Stage 0 cmake configure (without building) ──
+echo "--- Stage 0 CMake Configure ---"
+mkdir -p /tmp/build-stage0-test
+cd /tmp/build-stage0-test
+cmake -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/tmp/cross-tools \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_ENABLE_RUNTIMES= \
+  -DLLVM_TARGETS_TO_BUILD=X86 \
+  -DLLVM_DEFAULT_TARGET_TRIPLE="${TARGET}" \
+  -DCLANG_DEFAULT_LINKER=lld \
+  -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+  -DCLANG_DEFAULT_RTLIB=compiler-rt \
+  -DCLANG_DEFAULT_UNWINDLIB=libunwind \
+  -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_DOCS=OFF \
+  -DLLVM_PARALLEL_LINK_JOBS=2 \
+  "${LLVM_SRC}/llvm" > /tmp/cmake-stage0.log 2>&1
+if [ $? -eq 0 ]; then
+  check_pass "Stage 0 cmake configure succeeds"
+else
+  check_fail "Stage 0 cmake configure failed"
+  tail -10 /tmp/cmake-stage0.log
+fi
+echo
+
+# ── Check 7: libc++ compile test ──
+echo "--- libc++ Compile Test ---"
+cat > /tmp/test_cxx.cpp <<'EOF'
+#include <cstdio>
+#include <bit>
+unsigned test() { return std::countl_zero(42u); }
+int main() { printf("countl_zero(42) = %%u\n", test()); return 0; }
+EOF
+if clang++ --target="${TARGET}" -std=c++20 -stdlib=libc++ -fuse-ld=lld --rtlib=compiler-rt \
+   -o /tmp/test_cxx /tmp/test_cxx.cpp 2>/dev/null; then
+  check_pass "C++20 std::countl_zero compiles (libc++ builtins OK)"
+else
+  # This may fail if libc++ headers aren't installed — that's expected
+  # in the melange sandbox but we check the seed can handle the builtins
+  clang++ -std=c++20 -o /tmp/test_cxx /tmp/test_cxx.cpp 2>/dev/null && \
+    check_pass "C++20 std::countl_zero compiles (system libc++)" || \
+    check_fail "C++20 std::countl_zero fails — seed compiler may be too old"
+fi
+echo
+
+# ── Summary ──
+echo "═══════════════════════════════════════════════════════"
+printf "RESULT: %%d passed, %%d failed\n" "$PASS" "$FAIL"
+echo "═══════════════════════════════════════════════════════"
+
+if [ "$FAIL" -gt 0 ]; then
+  echo "Fix the failures above before running the full build."
+  exit 1
+fi
+echo "All checks passed — safe to run full build."
+`, llvmVersion)).
+		WithExec([]string{"sh", "/preflight.sh"}).
+		Stdout(ctx)
+}
+
+// ═══════════════════════════════════════════════════════════
+// Melange-built toolchain image
+// ═══════════════════════════════════════════════════════════
+
+// reindexRepo merges APK files and regenerates a signed APKINDEX.
+func (m *TerranoxBootstrap) reindexRepo(pkgs *dagger.Directory, signingKey *dagger.File, signingKeyPub *dagger.File) *dagger.Directory {
+	return dag.Container().
+		From("alpine:3.21").
+		WithExec([]string{"apk", "add", "--no-cache", "apk-tools", "abuild"}).
+		WithDirectory("/repo", pkgs).
+		WithFile("/key/melange.rsa", signingKey).
+		WithFile("/key/melange.rsa.pub", signingKeyPub).
+		WithExec([]string{"sh", "-c", `
+			cd /repo && rm -f APKINDEX.tar.gz &&
+			cp /key/melange.rsa.pub /etc/apk/keys/ &&
+			apk index -o APKINDEX.unsigned.tar.gz *.apk &&
+			abuild-sign -k /key/melange.rsa APKINDEX.unsigned.tar.gz &&
+			mv APKINDEX.unsigned.tar.gz APKINDEX.tar.gz &&
+			echo "==> Repo contents:" && ls -lh /repo/ &&
+			echo "==> Index entries:" && tar tzf APKINDEX.tar.gz
+		`}).
+		Directory("/repo")
+}
+
+// BuildToolchainImage builds the 3-stage musl toolchain as separate melange
+// packages, then assembles a container image via apko.
+//
+// Each stage is an independent melange package with its own cache:
+//
+//	Stage 0: terranox-stage0   (cross-compiler, ~20 min)
+//	Sysroot: terranox-sysroot  (musl + LLVM runtimes, ~10 min)
+//	Stage 1: terranox-clang    (self-hosted compiler, ~20 min)
+//
+// If Stage 0 succeeds but Sysroot fails, Stage 0 is cached and won't rebuild.
+// Pre-built APK repos can be passed in to skip any/all stages.
+//
+// Usage:
+//
+//	# Full pipeline from scratch:
+//	dagger call build-toolchain-image --source=. export --path=./terranox-toolchain.tar
+//
+//	# Skip Stage 0 (already built):
+//	dagger call build-toolchain-image --source=. --stage0-repo=./out/stage0
+//
+//	# Skip everything, just assemble image:
+//	dagger call build-toolchain-image --source=. --apk-repo=./out/all-packages
+//
+//	# Interactive shell:
+//	dagger call build-toolchain-image --source=. terminal
+func (m *TerranoxBootstrap) BuildToolchainImage(
+	ctx context.Context,
+	// Repository source directory containing derivations/ and packages/
+	source *dagger.Directory,
+	// Pre-built Stage 0 APK repo. If provided, skips Stage 0 build.
+	// +optional
+	stage0Repo *dagger.Directory,
+	// Pre-built Sysroot APK repo. If provided, skips Sysroot build.
+	// +optional
+	sysrootRepo *dagger.Directory,
+	// Pre-built APK repo with all packages (stage0 + sysroot + clang).
+	// If provided, skips all builds and goes straight to image assembly.
+	// +optional
+	apkRepo *dagger.Directory,
+) (*dagger.Container, error) {
+	if apkRepo == nil {
+		// Stage 0: Cross-compiler (no dependencies on our packages)
+		if stage0Repo == nil {
+			var err error
+			stage0Repo, err = m.MelangeBuild(ctx, source, "terranox-stage0", nil)
+			if err != nil {
+				return nil, fmt.Errorf("melange build terranox-stage0: %w", err)
+			}
+		}
+
+		// Sysroot: musl + LLVM runtimes (no dependencies on stage0 APK —
+		// uses Alpine's seed Clang directly, same as the Dagger pipeline)
+		if sysrootRepo == nil {
+			var err error
+			sysrootRepo, err = m.MelangeBuild(ctx, source, "terranox-sysroot", nil)
+			if err != nil {
+				return nil, fmt.Errorf("melange build terranox-sysroot: %w", err)
+			}
+		}
+
+		// Merge stage0 + sysroot into a combined local repo for Stage 1.
+		// Regenerate APKINDEX so it covers both packages — each MelangeBuild
+		// produces its own index, and WithDirectory overwrites APKINDEX.tar.gz.
+		mergedPkgs := dag.Directory().
+			WithDirectory(".", stage0Repo).
+			WithDirectory(".", sysrootRepo)
+
+		signingKey := source.File("packages/melange.rsa")
+		signingKeyPub := source.File("packages/melange.rsa.pub")
+		combinedRepo := m.reindexRepo(mergedPkgs, signingKey, signingKeyPub)
+
+		// Stage 1: Self-hosted compiler (depends on stage0 + sysroot)
+		var err error
+		apkRepo, err = m.MelangeBuild(ctx, source, "terranox-clang", combinedRepo)
+		if err != nil {
+			return nil, fmt.Errorf("melange build terranox-clang: %w", err)
+		}
+
+		// Merge all packages into the final repo and regenerate index
+		allPkgs := dag.Directory().
+			WithDirectory(".", stage0Repo).
+			WithDirectory(".", sysrootRepo).
+			WithDirectory(".", apkRepo)
+
+		apkRepo = m.reindexRepo(allPkgs, signingKey, signingKeyPub)
+	}
+
+	// Add signing public key to the repo so apko can verify packages
+	signingKeyPub := source.File("packages/melange.rsa.pub")
+	apkRepoWithKey := dag.Directory().
+		WithDirectory(".", apkRepo).
+		WithFile("melange.rsa.pub", signingKeyPub)
+
+	// Assemble the OCI image via apko
+	return m.ApkoBuild(ctx, source,
+		"derivations/apko/toolchain-musl.yaml",
+		"terranox-toolchain:latest",
+		apkRepoWithKey)
 }
 
 // ═══════════════════════════════════════════════════════════

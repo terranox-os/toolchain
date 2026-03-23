@@ -98,11 +98,11 @@ func (m *TerranoxBootstrap) MuslStage0(
 			"-DLLVM_INCLUDE_BENCHMARKS=OFF",
 			"-DLLVM_INCLUDE_DOCS=OFF",
 			// Limit parallel link jobs — each LLVM link uses 4-8 GB RAM.
-			// Without this, -j4 can launch 4 link jobs simultaneously and
-			// OOM on CI runners (16 GB), falling back to swap.
+			// Without this, nproc link jobs can launch simultaneously and
+			// OOM on machines with limited RAM.
 			"-DLLVM_PARALLEL_LINK_JOBS=2",
 			"/tmp/llvm-project/llvm"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		Directory("/opt/terranox/cross-tools")
 }
@@ -244,7 +244,7 @@ func (m *TerranoxBootstrap) MuslSysroot(
 			"-DLIBCXX_ENABLE_SHARED=OFF",
 			"-DLIBCXX_CXX_ABI=libcxxabi",
 			"/tmp/llvm-project/runtimes"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		// Create libgcc compatibility shim
 		WithExec([]string{"sh", "-c",
@@ -533,7 +533,7 @@ func (m *TerranoxBootstrap) MuslStage1(
 			"-DLLVM_INCLUDE_BENCHMARKS=OFF",
 			"-DLLVM_PARALLEL_LINK_JOBS=2",
 			"/tmp/llvm-project/llvm"}).
-		WithExec([]string{"ninja", "-j4"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		Directory("/opt/terranox/tools")
 }

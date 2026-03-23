@@ -61,7 +61,7 @@ func (m *TerranoxBootstrap) GnatLLVM(
 			// Don't set LLVM_INSTALL_TOOLCHAIN_ONLY - we need llvm-config and libraries
 			// Don't set LLVM_ENABLE_RUNTIMES - causes build failures (ERROR #12)
 			"/tmp/llvm-project/llvm"}).
-		WithExec([]string{"ninja", "-j2"}).
+		WithExec([]string{"sh", "-c", "ninja -j$(nproc)"}).
 		WithExec([]string{"ninja", "install"}).
 		// Install Alire (Ada package manager)
 		WithWorkdir("/tmp").
