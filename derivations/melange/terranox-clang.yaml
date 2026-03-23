@@ -144,14 +144,36 @@ pipeline:
         -DCLANG_DEFAULT_RTLIB=compiler-rt \
         -DCLANG_DEFAULT_UNWINDLIB=libunwind \
         -DDEFAULT_SYSROOT=/usr/share/terranox-sysroot \
-        -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+        -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLLVM_INCLUDE_EXAMPLES=OFF \
         -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_DOCS=OFF \
         -DLLVM_PARALLEL_LINK_JOBS=2 \
         "${LLVM_SRC}/llvm"
       ninja -j${NJOBS}
       DESTDIR="${{targets.destdir}}" ninja install
+
+      # Install extra LLVM tools not included by TOOLCHAIN_ONLY=ON.
+      # These are useful for development but not part of the minimal toolchain.
+      for tool in llvm-readelf llvm-readobj llvm-size llvm-strings llvm-symbolizer; do
+        if [ -f "bin/${tool}" ]; then
+          cp "bin/${tool}" "${{targets.destdir}}/usr/bin/"
+        fi
+      done
+
+      # Strip all binaries to remove debug info (~50% size reduction)
+      echo "==> Stripping binaries"
+      find "${{targets.destdir}}/usr/bin" -type f -executable | while read f; do
+        llvm-strip "$f" 2>/dev/null || true
+      done
+
+      # Remove LLVM static libraries — not needed for using the toolchain
+      rm -f "${{targets.destdir}}/usr/lib/libLLVM"*.a \
+            "${{targets.destdir}}/usr/lib/libclang"*.a \
+            "${{targets.destdir}}/usr/lib/liblld"*.a \
+            "${{targets.destdir}}/usr/lib/libPolly"*.a 2>/dev/null
+      echo "==> Cleaned up static libs"
 
       # ── Install clang resource directory ────────────────────
       echo "==> Installing runtime libraries"

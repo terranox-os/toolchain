@@ -61,6 +61,7 @@ environment:
       - rsync
       - gcc
       - sed
+      - apk-tools
 
 pipeline:
   - runs: |
@@ -166,6 +167,34 @@ pipeline:
       # causing undefined __cxa_* symbols.
       mv "${SYSROOT}/usr/lib/libc++.a" "${SYSROOT}/usr/lib/libc++_real.a"
       echo 'INPUT(libc++_real.a libc++abi.a)' > "${SYSROOT}/usr/lib/libc++.a"
+
+      # ── SDK dev packages ─────────────────────────────────
+      # Install Alpine dev headers and static libraries into the sysroot
+      # so clang can find them via --sysroot. These are musl-linked and
+      # ABI-compatible since Alpine is musl-native.
+      echo "==> Installing SDK dev packages into sysroot"
+      SDK_PKGS="zlib-dev zlib-static openssl-dev openssl-libs-static ncurses-dev readline-dev libffi-dev xz-dev bzip2-dev"
+      mkdir -p /tmp/sdk-pkgs
+      apk fetch --no-cache -o /tmp/sdk-pkgs ${SDK_PKGS} 2>/dev/null || true
+      for apk in /tmp/sdk-pkgs/*.apk; do
+        [ -f "$apk" ] || continue
+        echo "  Extracting: $(basename "$apk")"
+        tar -xzf "$apk" -C "${SYSROOT}" 2>/dev/null || true
+      done
+      # Remove apk metadata that may have been extracted
+      rm -rf "${SYSROOT}/.PKGINFO" "${SYSROOT}/.SIGN."* "${SYSROOT}/.post-install" "${SYSROOT}/.pre-install" "${SYSROOT}/.trigger"
+
+      # Strip debug info from Alpine static libraries — their compressed
+      # debug sections (.debug_info etc.) use ELFCOMPRESS_ZLIB which our
+      # LLD doesn't support. Stripping removes the sections entirely.
+      echo "==> Stripping debug info from SDK libraries"
+      find "${SYSROOT}/usr/lib" -name "*.a" -exec llvm-strip --strip-debug {} \; 2>/dev/null || true
+
+      # Copy pkg-config files so cross-compilation finds them
+      if [ -d "${SYSROOT}/usr/lib/pkgconfig" ]; then
+        echo "  pkg-config files:"
+        ls "${SYSROOT}/usr/lib/pkgconfig/"*.pc 2>/dev/null | sed 's|.*/||' | head -10
+      fi
 
       # Also install runtime libs to /usr/lib for packages that link directly
       mkdir -p "${{targets.destdir}}/usr/lib"

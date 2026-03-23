@@ -1843,8 +1843,40 @@ SYSROOT=/usr/share/terranox-sysroot
 [ -f $SYSROOT/usr/include/c++/v1/iostream ] && check_pass "libc++ headers" || check_fail "libc++ headers missing"
 echo
 
-# ── Test 9: Binary inspection ──
-echo "--- Test 9: Binary properties ---"
+# ── Test 9: SDK dev libraries ──
+echo "--- Test 9: SDK dev libraries ---"
+[ -f $SYSROOT/usr/include/zlib.h ] && check_pass "zlib headers" || check_fail "zlib headers missing"
+[ -f $SYSROOT/usr/lib/libz.a ] && check_pass "zlib static lib" || check_fail "zlib static lib missing"
+[ -f $SYSROOT/usr/include/openssl/ssl.h ] && check_pass "openssl headers" || check_fail "openssl headers missing"
+[ -f $SYSROOT/usr/lib/libssl.a ] && check_pass "openssl static lib" || check_fail "openssl static lib missing"
+[ -f $SYSROOT/usr/include/ncurses.h ] && check_pass "ncurses headers" || check_fail "ncurses headers missing"
+[ -f $SYSROOT/usr/include/readline/readline.h ] && check_pass "readline headers" || check_fail "readline headers missing"
+
+# Compile test with zlib
+echo '#include <zlib.h>
+#include <stdio.h>
+int main(void) { printf("zlib: %s\n", zlibVersion()); return 0; }' > /tmp/tz.c
+if clang -o /tmp/tz /tmp/tz.c -lz 2>&1; then
+  /tmp/tz
+  check_pass "zlib compile + link"
+else
+  check_fail "zlib compile + link"
+fi
+
+# Compile test with openssl
+echo '#include <openssl/evp.h>
+#include <stdio.h>
+int main(void) { printf("OpenSSL: %s\n", OpenSSL_version(0)); return 0; }' > /tmp/ts.c
+if clang -o /tmp/ts /tmp/ts.c -lssl -lcrypto 2>&1; then
+  /tmp/ts
+  check_pass "openssl compile + link"
+else
+  check_fail "openssl compile + link"
+fi
+echo
+
+# ── Test 10: Binary inspection ──
+echo "--- Test 10: Binary properties ---"
 file /tmp/hello | grep -q "ELF 64-bit" && check_pass "ELF 64-bit binary" || check_fail "not ELF 64-bit"
 file /tmp/hello | grep -q "musl" && check_pass "musl-linked" || check_fail "not musl-linked"
 llvm-readelf -d /tmp/hello 2>/dev/null | grep -q "NEEDED" && check_pass "dynamic binary" || check_fail "readelf failed"

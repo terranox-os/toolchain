@@ -41,6 +41,8 @@ contents:
     - pkgconf
     - patch
     - file
+    - bison
+    - flex
 
     # -- Dev headers + static libs --
     - musl-dev
