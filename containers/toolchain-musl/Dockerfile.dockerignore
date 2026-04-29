@@ -1,0 +1,4 @@
+*
+!toolchain/llvm/tools/**
+!toolchain/llvm/sysroot/**
+!toolchain/llvm/manifest.json

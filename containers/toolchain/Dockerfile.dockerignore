@@ -1,0 +1,4 @@
+# Ignore everything except the pre-built toolchain directories
+*
+!toolchain/glibc-stage1/**
+!toolchain/glibc-sysroot/**

@@ -76,6 +76,16 @@ version = "2.39"
 
 These add `x86_64-pc-terranox` as a recognized OS target with `__terranox__` defined.
 
+## Containers
+
+`containers/` contains Dockerfiles for packaging exported toolchain artifacts:
+
+- `containers/toolchain/` packages the glibc-linked stage1 toolchain with a musl sysroot.
+- `containers/toolchain-musl/` packages the musl-linked toolchain and sysroot.
+
+Build these from a checkout that already has exported toolchain artifacts under
+`toolchain/`.
+
 ## License
 
 Apache-2.0
