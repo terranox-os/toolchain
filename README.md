@@ -86,6 +86,20 @@ These add `x86_64-pc-terranox` as a recognized OS target with `__terranox__` def
 Build these from a checkout that already has exported toolchain artifacts under
 `toolchain/`.
 
+## Documentation
+
+Detailed bootstrap and validation notes live in `docs/`:
+
+- `TRX-DOC-0200-bootstrap-toolchain-spec.md`
+- `TRX-DOC-0201-bootstrap-dagger.md`
+- `TRX-DOC-0202-bootstrap-config.md`
+- `TRX-DOC-0203-llvm-edge-cases.md`
+- `TRX-DOC-0204-clfs-guide.md`
+- `TRX-DOC-0205-sysroot-build-guide.md`
+- `TRX-DOC-0206-triple-testing.md`
+- `TRX-DOC-0207-toolchain-image-testing.md`
+- `TRX-DOC-0208-bootstrap-testing-log.md`
+
 ## License
 
 Apache-2.0
