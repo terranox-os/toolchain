@@ -66,7 +66,8 @@ func (m *TerranoxBootstrap) MuslStage0(
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "--no-cache",
 			"bash", "cmake", "ninja", "samurai", "python3",
-			"clang", "lld", "llvm", "musl-dev", "linux-headers",
+			"clang", "lld", "llvm", "compiler-rt", "gcc", "g++",
+			"musl-dev", "linux-headers",
 			"git", "file", "ccache"}).
 		// Mount persistent ccache volume to cache compiled objects across builds.
 		// When inputs change (patches, base image), ccache still hits for
