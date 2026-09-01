@@ -66,7 +66,8 @@ func (m *TerranoxBootstrap) MuslStage0(
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "--no-cache",
 			"bash", "cmake", "ninja", "samurai", "python3",
-			"clang", "lld", "llvm", "musl-dev", "linux-headers",
+			"clang", "lld", "llvm", "compiler-rt", "gcc", "g++",
+			"musl-dev", "linux-headers",
 			"git", "file", "ccache"}).
 		// Mount persistent ccache volume to cache compiled objects across builds.
 		// When inputs change (patches, base image), ccache still hits for
@@ -92,6 +93,12 @@ func (m *TerranoxBootstrap) MuslStage0(
 			"-DCLANG_DEFAULT_CXX_STDLIB=libc++",
 			"-DCLANG_DEFAULT_RTLIB=compiler-rt",
 			"-DCLANG_DEFAULT_UNWINDLIB=libunwind",
+			// Alpine does not guarantee a GNU ld shim when only LLVM's
+			// linker is installed. Keep the seed build pure-LLVM and make
+			// every CMake link probe use ld.lld explicitly.
+			"-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
+			"-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
+			"-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
 			"-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON",
 			"-DLLVM_INCLUDE_TESTS=OFF",
 			"-DLLVM_INCLUDE_EXAMPLES=OFF",
@@ -186,6 +193,7 @@ func (m *TerranoxBootstrap) MuslSysroot(
 		// Build full musl
 		WithExec([]string{"sh", "-c",
 			`CC="clang --target=` + Target + `" AR=llvm-ar RANLIB=llvm-ranlib ` +
+				`LDFLAGS="-fuse-ld=lld" ` +
 				`./configure --prefix=/usr --target=` + Target + ` --disable-wrapper`}).
 		WithExec([]string{"make", fmt.Sprintf("-j%d", 4)}).
 		WithExec([]string{"make", "DESTDIR=/opt/terranox/sysroot", "install"}).
