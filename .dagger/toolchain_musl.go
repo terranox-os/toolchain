@@ -92,6 +92,12 @@ func (m *TerranoxBootstrap) MuslStage0(
 			"-DCLANG_DEFAULT_CXX_STDLIB=libc++",
 			"-DCLANG_DEFAULT_RTLIB=compiler-rt",
 			"-DCLANG_DEFAULT_UNWINDLIB=libunwind",
+			// Alpine does not guarantee a GNU ld shim when only LLVM's
+			// linker is installed. Keep the seed build pure-LLVM and make
+			// every CMake link probe use ld.lld explicitly.
+			"-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
+			"-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
+			"-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
 			"-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON",
 			"-DLLVM_INCLUDE_TESTS=OFF",
 			"-DLLVM_INCLUDE_EXAMPLES=OFF",
