@@ -192,6 +192,7 @@ func (m *TerranoxBootstrap) MuslSysroot(
 		// Build full musl
 		WithExec([]string{"sh", "-c",
 			`CC="clang --target=` + Target + `" AR=llvm-ar RANLIB=llvm-ranlib ` +
+				`LDFLAGS="-fuse-ld=lld" ` +
 				`./configure --prefix=/usr --target=` + Target + ` --disable-wrapper`}).
 		WithExec([]string{"make", fmt.Sprintf("-j%d", 4)}).
 		WithExec([]string{"make", "DESTDIR=/opt/terranox/sysroot", "install"}).
